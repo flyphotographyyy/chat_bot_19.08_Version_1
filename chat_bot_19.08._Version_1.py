@@ -795,7 +795,7 @@ with col_dl2:
     diag = [{
         "ticker": r["ticker"],
         "score": r.get("score"),
-        "signal": r.get("signal"],
+        "signal": r.get("signal"),
         "metrics": r.get("metrics"),
         "explanations": r.get("explanations"),
     } for r in results]
