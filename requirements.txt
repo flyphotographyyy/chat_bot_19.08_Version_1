@@ -5,5 +5,11 @@ numpy==2.3.2
 plotly==6.3.0
 streamlit-autorefresh==1.0.1
 requests==2.32.4
+
+# за акаунти/база в облака (без платен диск)
 supabase==2.18.1
 realtime>=2.5
+
+# за username нормализация (ползва се в app.py)
+python-slugify==8.0.4
+
