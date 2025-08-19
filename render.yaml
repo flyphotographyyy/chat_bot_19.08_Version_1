@@ -1,0 +1,21 @@
+# render.yaml
+services:
+  - type: web
+    name: watchlist-swing-assistant
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.address 0.0.0.0 --server.port $PORT"
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Ако по-късно добавиш Persistent Disk и искаш да го ползваш:
+      - key: DATA_DIR
+        value: /var/data
+    # Ако искаш да запазваш watchlist-а между рестарти, добави диск:
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
