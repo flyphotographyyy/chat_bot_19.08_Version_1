@@ -1,19 +1,16 @@
 # streamlit_watchlist_bot_app.py
-
-# Streamlit Watchlist Swing-Assistant (Semi-Auto)
-# ------------------------------------------------
-# 1) Личен watchlist
-# 2) Данни от yfinance
-# 3) Индикатори + композитен score под 3 risk профила
-# 4) BUY / HOLD / SELL + обяснения
-# 5) Plotly чарта с анотации (SL/TP)
-# 6) Запазване на настройки локално (JSON)
-# 7) Експорт на таблица (CSV) и diagnostics (JSON)
-# 8) Auto-refresh (по избор) чрез streamlit-autorefresh
+# =========================================================
+# Streamlit Watchlist Swing-Assistant (Semi-Auto) + Profiles
+# - Лични профили чрез Profile ID + PIN (хеширани локално)
+# - Всеки профил има собствен JSON за тикери/настройки
+# - Непроменена логика на анализа/сигналите
+# =========================================================
 
 from __future__ import annotations
 import json
 import os
+import re
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -41,20 +38,24 @@ except Exception:
 # ---------------- Config ----------------
 APP_TITLE = "📈 Watchlist Swing-Assistant"
 DATA_DIR = "data"
-WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
+USERS_DIR = os.path.join(DATA_DIR, "users")
+USERS_INDEX = os.path.join(DATA_DIR, "users_index.json")  # {profile_id: {"pin_hash": "..."}}
+
 DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "META"]
 DEFAULT_PROFILE = "Balanced"
 CACHE_TTL_SECONDS = 60 * 15
 MAX_LOOKBACK_DAYS = 240
 CHART_WINDOW_DAYS = 180
 
+
 # ---------------- Utilities ----------------
-def _ensure_data_dir() -> bool:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        return True
-    except Exception:
-        return False
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _ensure_data_dir() -> None:
+    _ensure_dir(DATA_DIR)
+    _ensure_dir(USERS_DIR)
 
 
 def _load_json_safe(path: str, default: Any) -> Any:
@@ -75,23 +76,128 @@ def _save_json_safe(path: str, payload: Any) -> bool:
         return False
 
 
-# ---------------- Persistence ----------------
-def load_watchlist() -> Dict[str, Any]:
-    default = {
+# ---------------- Mini auth layer (Profile ID + PIN) ----------------
+def _slugify_user_id(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s).strip("_").lower()
+    return s or "user"
+
+
+def _hash_pin(pin: str) -> str:
+    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
+
+
+def _users_index() -> Dict[str, Dict[str, str]]:
+    return _load_json_safe(USERS_INDEX, {})
+
+
+def _save_users_index(ix: Dict[str, Dict[str, str]]) -> None:
+    _save_json_safe(USERS_INDEX, ix)
+
+
+def _user_file(profile_id: str) -> str:
+    _ensure_data_dir()
+    return os.path.join(USERS_DIR, f"{profile_id}.json")
+
+
+def _default_state() -> Dict[str, Any]:
+    return {
         "tickers": DEFAULT_TICKERS,
         "profile": DEFAULT_PROFILE,
         "auto_refresh_minutes": 15,
         "acct_size": 10000.0,
         "risk_pct": 1.0,
+        "relax_guards": False,
+        "market_guard": True,
+        "ts_enabled": False,
+        "ts_mult": 1.5,
     }
+
+
+def _init_user_file_if_missing(profile_id: str) -> None:
+    path = _user_file(profile_id)
+    if not os.path.exists(path):
+        _save_json_safe(path, _default_state())
+
+
+def _set_active_user(profile_id: str) -> None:
+    st.session_state["auth_user"] = profile_id
+    st.session_state["active_user_file"] = _user_file(profile_id)
+    _init_user_file_if_missing(profile_id)
+
+
+def _logout_user() -> None:
+    for k in ["auth_user", "active_user_file", "watchlist_state"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def login_gate() -> None:
+    """UI gate — ако няма логнат потребител, показва логин/създаване на профил и спира приложението след submit."""
+    st.sidebar.markdown("## 🔐 Profile")
+    if "auth_user" in st.session_state and st.session_state["auth_user"]:
+        pid = st.session_state["auth_user"]
+        st.sidebar.success(f"Signed in: **{pid}**")
+        if st.sidebar.button("Logout"):
+            _logout_user()
+            st.rerun()
+        return
+
+    # Not signed in -> show login form
+    with st.sidebar.form("login_form", clear_on_submit=False):
+        st.markdown("**Sign in / Create profile**")
+        raw_id = st.text_input("Profile ID (letters/numbers)", placeholder="e.g. ivan")
+        pin = st.text_input("PIN (4+ digits)", type="password")
+        colA, colB = st.columns(2)
+        submit_login = colA.form_submit_button("Sign in")
+        submit_create = colB.form_submit_button("Create / Reset")
+
+    if submit_login or submit_create:
+        pid = _slugify_user_id(raw_id or "")
+        if not pid or not pin or len(pin) < 4:
+            st.sidebar.error("Enter valid Profile ID and a 4+ digit PIN.")
+            st.stop()
+
+        ix = _users_index()
+        pin_hash = _hash_pin(pin)
+
+        if submit_create:
+            ix[pid] = {"pin_hash": pin_hash}
+            _save_users_index(ix)
+            _set_active_user(pid)
+            st.sidebar.success(f"Profile **{pid}** ready.")
+            st.rerun()
+
+        if submit_login:
+            rec = ix.get(pid)
+            if not rec or rec.get("pin_hash") != pin_hash:
+                st.sidebar.error("Invalid Profile ID or PIN.")
+                st.stop()
+            _set_active_user(pid)
+            st.sidebar.success(f"Welcome, **{pid}**!")
+            st.rerun()
+
+    # Gate: stop app until signed in
+    st.stop()
+
+
+# ---------------- Persistence (per active user) ----------------
+def load_watchlist() -> Dict[str, Any]:
+    """Зарежда състояние от активния профил."""
+    default = _default_state()
+    file_path = st.session_state.get("active_user_file")
+    if not file_path:
+        return default
     if "watchlist_state" not in st.session_state:
-        st.session_state.watchlist_state = _load_json_safe(WATCHLIST_FILE, default)
+        st.session_state.watchlist_state = _load_json_safe(file_path, default)
     return st.session_state.watchlist_state
 
 
 def save_watchlist(state: Dict[str, Any]) -> None:
+    """Записва състояние в активния профил."""
     st.session_state.watchlist_state = state
-    _save_json_safe(WATCHLIST_FILE, state)
+    file_path = st.session_state.get("active_user_file")
+    if file_path:
+        _save_json_safe(file_path, state)
 
 
 # ---------------- Indicators ----------------
@@ -396,7 +502,7 @@ def analyze_ticker(
         if not allowed:
             score -= 1.0; reasons.append(f"Earnings in {days_to_earn}d (blackout)")
 
-    # Cooldown: 3 последователни зелени дни + overextension
+    # Cooldown
     if ext_pct is not None and ext_pct > 8 and len(df) >= 4:
         last3 = df["Close"].pct_change().iloc[-3:] > 0
         if last3.sum() == 3: score -= 0.25; reasons.append("3 green days while extended — cooldown")
@@ -516,6 +622,9 @@ def build_chart(df: pd.DataFrame, title: str, sl: float | None = None, tp: float
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
+# 🔑 Profile gate
+login_gate()
+
 # Guard missing yfinance
 if yf is None:
     st.error("Missing dependency: 'yfinance'. Add a requirements.txt with the packages below, then Clear cache → Rerun.")
@@ -597,7 +706,7 @@ with st.sidebar:
 # Auto refresh (if plugin available)
 if state.get("auto_refresh_minutes", 15) > 0:
     if HAS_AUTOR:
-        st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
+        st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key=f"autorefresh_{st.session_state['auth_user']}")
     else:
         st.info("Auto-refresh unavailable (install 'streamlit-autorefresh') or use the Refresh button.")
 
@@ -612,7 +721,7 @@ if not watch:
     st.info("Add tickers to your watchlist from the sidebar to begin.")
     st.stop()
 
-st.write(f"**Profile:** {profile}  •  **Tickers:** {', '.join(watch)}")
+st.write(f"**Signed in as:** `{st.session_state['auth_user']}`  •  **Profile:** {profile}  •  **Tickers:** {', '.join(watch)}")
 
 acct_size = float(state.get("acct_size", 10000.0))
 risk_pct = float(state.get("risk_pct", 1.0))
@@ -626,7 +735,7 @@ with st.expander("Optional: IBKR Last Prices (manual to compare deltas)"):
     cols = st.columns(min(4, len(watch))) if len(watch) > 0 else [st]
     for i, t in enumerate(watch):
         with cols[i % len(cols)]:
-            val = st.text_input(f"{t}", placeholder="e.g. 198.23")
+            val = st.text_input(f"{t}", placeholder="e.g. 198.23", key=f"ibkr_{st.session_state['auth_user']}_{t}")
             try:
                 ibkr_inputs[t] = float(val) if val else None
             except Exception:
@@ -636,7 +745,8 @@ with st.expander("Optional: IBKR Last Prices (manual to compare deltas)"):
 results: List[Dict[str, Any]] = []
 with st.spinner("Analyzing tickers…"):
     for t in watch:
-        res = analyze_ticker(t, profile, optional_ibkr_price=ibkr_inputs.get(t), relax_guards=relax_guards, market_guard=market_guard)
+        res = analyze_ticker(t, profile, optional_ibkr_price=ibkr_inputs.get(t),
+                             relax_guards=relax_guards, market_guard=market_guard)
         results.append(res)
 
 # Summary table
@@ -678,21 +788,21 @@ with col_dl1:
     st.download_button(
         label="⬇️ Download table (CSV)",
         data=summary_df.to_csv(index=False).encode("utf-8"),
-        file_name="watchlist_signals.csv",
+        file_name=f"{st.session_state['auth_user']}_watchlist_signals.csv",
         mime="text/csv",
     )
 with col_dl2:
     diag = [{
         "ticker": r["ticker"],
         "score": r.get("score"),
-        "signal": r.get("signal"),
+        "signal": r.get("signal"],
         "metrics": r.get("metrics"),
         "explanations": r.get("explanations"),
     } for r in results]
     st.download_button(
         label="⬇️ Download diagnostics (JSON)",
         data=json.dumps(diag, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name="watchlist_diagnostics.json",
+        file_name=f"{st.session_state['auth_user']}_watchlist_diagnostics.json",
         mime="application/json",
     )
 
@@ -727,7 +837,7 @@ for r in results:
 
     with st.expander("📋 IBKR order (copy)"):
         side_default = 0 if r.get("signal") == "BUY" else 1
-        side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{t}")
+        side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{st.session_state['auth_user']}_{t}")
         entry = m.get("price")
         atr_abs = m.get("atr14")
         sl_mult = m.get("sl_mult")
