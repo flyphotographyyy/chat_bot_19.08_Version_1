@@ -1,19 +1,11 @@
-# app.py
-
-# Streamlit Watchlist Swing-Assistant (Semi-Auto)
-# ------------------------------------------------
-# 1) Личен watchlist
-# 2) Данни от yfinance
-# 3) Индикатори + композитен score под 3 risk профила
-# 4) BUY / HOLD / SELL + обяснения
-# 5) Plotly чарта с анотации (SL/TP)
-# 6) Запазване на настройки локално (JSON)
-# 7) Експорт на таблица (CSV) и diagnostics (JSON)
-# 8) Auto-refresh (по избор) чрез streamlit-autorefresh
+# app.py  — Streamlit Watchlist Swing-Assistant + Supabase auth (username+password)
+# -------------------------------------------------------------------------------
+# ЗАПАЗЕН UI/логика; добавени:
+# - Вход/регистрация с username+парола (без имейли за потребителя)
+# - Данните (watchlist/настройки) се пазят в Supabase -> не изисква платен диск на Render
 
 from __future__ import annotations
-import json
-import os
+import json, os, time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -21,12 +13,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Optional deps
 try:
     import plotly.graph_objects as go
 except Exception:
     go = None
 
-# Optional deps (graceful fallbacks)
 try:
     import yfinance as yf
 except Exception:
@@ -38,87 +30,41 @@ try:
 except Exception:
     HAS_AUTOR = False
 
+# --- Supabase (free, no disk needed) ---
+from slugify import slugify
+from supabase import create_client, Client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+sb: Client | None = create_client(SUPABASE_URL, SUPABASE_ANON_KEY) if (SUPABASE_URL and SUPABASE_ANON_KEY) else None
+
 # ---------------- Config ----------------
 APP_TITLE = "📈 Watchlist Swing-Assistant"
-
-# Малка портируемост за Render/Persistent Disk:
-# Ако по-късно закачиш Persistent Disk и сложиш DATA_DIR env var да сочи към mount path-а,
-# приложението ще ползва него; иначе си пада към локална 'data' папка.
-DATA_DIR = os.environ.get("DATA_DIR", "data")
-WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
-
 DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "META"]
 DEFAULT_PROFILE = "Balanced"
 CACHE_TTL_SECONDS = 60 * 15
 MAX_LOOKBACK_DAYS = 240
 CHART_WINDOW_DAYS = 180
 
-# ---------------- Utilities ----------------
-def _ensure_data_dir() -> bool:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        return True
-    except Exception:
-        return False
+PROFILE_CONFIG = {
+    "Aggressive": {"buy_threshold": 4.0, "sell_threshold": -1.5, "volatility_penalty": 0.0,
+                   "earnings_blackout_days": 0, "rsi_upper": 80, "sl_atr_mult": 1.2, "tp_atr_mult": 2.0},
+    "Balanced":   {"buy_threshold": 4.5, "sell_threshold": -1.0, "volatility_penalty": 0.5,
+                   "earnings_blackout_days": 2, "rsi_upper": 75, "sl_atr_mult": 1.5, "tp_atr_mult": 2.5},
+    "Conservative":{"buy_threshold": 5.0, "sell_threshold": -0.5, "volatility_penalty": 1.0,
+                   "earnings_blackout_days": 5, "rsi_upper": 70, "sl_atr_mult": 1.8, "tp_atr_mult": 3.0},
+}
 
-
-def _load_json_safe(path: str, default: Any) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def _save_json_safe(path: str, payload: Any) -> bool:
-    try:
-        _ensure_data_dir()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
-
-
-# ---------------- Persistence ----------------
-def load_watchlist() -> Dict[str, Any]:
-    default = {
-        "tickers": DEFAULT_TICKERS,
-        "profile": DEFAULT_PROFILE,
-        "auto_refresh_minutes": 15,
-        "acct_size": 10000.0,
-        "risk_pct": 1.0,
-    }
-    if "watchlist_state" not in st.session_state:
-        st.session_state.watchlist_state = _load_json_safe(WATCHLIST_FILE, default)
-    return st.session_state.watchlist_state
-
-
-def save_watchlist(state: Dict[str, Any]) -> None:
-    st.session_state.watchlist_state = state
-    _save_json_safe(WATCHLIST_FILE, state)
-
-
-# ---------------- Indicators ----------------
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
-
-
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
+# ---------------- Helpers ----------------
+def sma(series: pd.Series, w: int) -> pd.Series: return series.rolling(w).mean()
+def ema(series: pd.Series, span: int) -> pd.Series: return series.ewm(span=span, adjust=False).mean()
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Robust RSI that accepts 1D Series or a 1-col DataFrame."""
     if isinstance(series, pd.DataFrame):
-        if series.shape[1] >= 1:
-            series = series.iloc[:, 0]
-        else:
-            series = pd.Series(dtype=float)
+        series = series.iloc[:, 0] if series.shape[1] else pd.Series(dtype=float)
     else:
         series = pd.Series(series)
     series = pd.to_numeric(series, errors="coerce")
-
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
@@ -127,42 +73,35 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / (avg_loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
 
-
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
+    low_close  = (df['Low']  - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-
-# ---- Helpers to extract 1D OHLCV from yfinance (handles MultiIndex) ----
 def _pick_series(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     if isinstance(df.columns, pd.MultiIndex):
+        # search by level names then flatten
         for key in keys:
             try:
                 if key in df.columns.get_level_values(0):
                     s = df[key]
-                    if isinstance(s, pd.DataFrame):
-                        s = s.iloc[:, 0]
+                    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
                     return pd.to_numeric(s, errors="coerce")
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 if key in df.columns.get_level_values(1):
                     s = df.xs(key, level=1, axis=1)
-                    if isinstance(s, pd.DataFrame):
-                        s = s.iloc[:, 0]
+                    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
                     return pd.to_numeric(s, errors="coerce")
-            except Exception:
-                pass
+            except Exception: pass
         flat = df.copy()
         flat.columns = ["|".join([str(x) for x in c]) if isinstance(c, tuple) else str(c) for c in flat.columns]
         for key in keys:
@@ -172,14 +111,11 @@ def _pick_series(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     else:
         for key in keys:
             exact = [c for c in df.columns if str(c).lower() == key.lower()]
-            if exact:
-                return pd.to_numeric(df[exact[0]], errors="coerce")
+            if exact: return pd.to_numeric(df[exact[0]], errors="coerce")
         for key in keys:
-            partial = [c for c in df.columns if key.lower() in str(c).lower()]
-            if partial:
-                return pd.to_numeric(df[partial[0]], errors="coerce")
+            part = [c for c in df.columns if key.lower() in str(c).lower()]
+            if part: return pd.to_numeric(df[part[0]], errors="coerce")
     return pd.Series(dtype=float)
-
 
 def _extract_ohlcv_1d(df: pd.DataFrame) -> pd.DataFrame:
     o = _pick_series(df, ["Open"])
@@ -190,32 +126,25 @@ def _extract_ohlcv_1d(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
     return out.dropna()
 
-
-# ---------------- Data Fetch (with light retry) ----------------
+# ---------------- Data ----------------
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_history(ticker: str, days: int = MAX_LOOKBACK_DAYS) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days * 2)
-
     df = pd.DataFrame()
-    for _ in range(2):  # до 2 опита
+    for _ in range(2):
         try:
             df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
         except Exception:
             df = pd.DataFrame()
-        if df is not None and not df.empty:
-            break
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+        if df is not None and not df.empty: break
+    if df is None or df.empty: return pd.DataFrame()
     df = df.rename(columns=lambda c: c.title() if isinstance(c, str) else c)
     return df.dropna()
 
-
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_info(ticker: str) -> Dict[str, Any]:
-    for _ in range(2):  # до 2 опита
+    for _ in range(2):
         try:
             tk = yf.Ticker(ticker)
             info = tk.info or {}
@@ -231,8 +160,6 @@ def fetch_info(ticker: str) -> Dict[str, Any]:
             pass
     return {"info": {}, "next_earnings": None}
 
-
-# ---------------- SPY fetch ----------------
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_spy() -> pd.DataFrame:
     try:
@@ -241,57 +168,18 @@ def fetch_spy() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
-# ---------------- Scoring & Profiles ----------------
-PROFILE_CONFIG = {
-    "Aggressive": {
-        "buy_threshold": 4.0,
-        "sell_threshold": -1.5,
-        "volatility_penalty": 0.0,
-        "earnings_blackout_days": 0,
-        "rsi_upper": 80,
-        "sl_atr_mult": 1.2,
-        "tp_atr_mult": 2.0,
-    },
-    "Balanced": {
-        "buy_threshold": 4.5,
-        "sell_threshold": -1.0,
-        "volatility_penalty": 0.5,
-        "earnings_blackout_days": 2,
-        "rsi_upper": 75,
-        "sl_atr_mult": 1.5,
-        "tp_atr_mult": 2.5,
-    },
-    "Conservative": {
-        "buy_threshold": 5.0,
-        "sell_threshold": -0.5,
-        "volatility_penalty": 1.0,
-        "earnings_blackout_days": 5,
-        "rsi_upper": 70,
-        "sl_atr_mult": 1.8,
-        "tp_atr_mult": 3.0,
-    },
-}
-
-
-def analyze_ticker(
-    ticker: str,
-    profile: str,
-    optional_ibkr_price: float | None = None,
-    relax_guards: bool = False,
-    market_guard: bool = True
-) -> Dict[str, Any]:
-    """Compute indicators, score, signal, ATR-based SL/TP, and guard flags."""
-    result = {"ticker": ticker, "error": None, "explanations": [], "score": 0.0, "signal": "HOLD", "metrics": {}, "df": None}
-
+# ---------------- Scoring ----------------
+def analyze_ticker(ticker: str, profile: str,
+                   optional_ibkr_price: float | None = None,
+                   relax_guards: bool = False, market_guard: bool = True) -> Dict[str, Any]:
+    res = {"ticker": ticker, "error": None, "explanations": [], "score": 0.0, "signal": "HOLD", "metrics": {}, "df": None}
     raw = fetch_history(ticker)
     if raw is None or raw.empty:
-        result["error"] = "No data"; return result
+        res["error"] = "No data"; return res
     df = _extract_ohlcv_1d(raw)
     if df is None or df.empty:
-        result["error"] = "No data"; return result
+        res["error"] = "No data"; return res
 
-    # Indicators
     df["SMA50"] = sma(df["Close"], 50)
     df["SMA200"] = sma(df["Close"], 200)
     df["RSI14"] = rsi(df["Close"], 14)
@@ -302,22 +190,20 @@ def analyze_ticker(
     df["VolAvg20"] = df["Volume"].rolling(20).mean()
     df["VolSurge"] = (df["Volume"] / (df["VolAvg20"] + 1e-9))
     df["High20"] = df["High"].rolling(20).max()
-    df["Low20"] = df["Low"].rolling(20).min()
+    df["Low20"]  = df["Low"].rolling(20).min()
 
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else df.iloc[-1]
     price = float(latest["Close"]) if not np.isnan(latest["Close"]) else None
     change_pct = ((latest["Close"] / prev["Close"]) - 1) * 100 if len(df) > 1 else 0.0
-
-    # Earnings / gap
     gap_pct = (latest["Open"] / prev["Close"] - 1) * 100 if len(df) > 1 and not np.isnan(latest.get("Open", np.nan)) and not np.isnan(prev.get("Close", np.nan)) else None
 
     info_blob = fetch_info(ticker)
-    next_earnings_date = info_blob.get("next_earnings")
+    next_earn = info_blob.get("next_earnings")
     days_to_earn = None
-    if next_earnings_date:
+    if next_earn:
         try:
-            d = pd.to_datetime(next_earnings_date)
+            d = pd.to_datetime(next_earn)
             days_to_earn = (d - pd.Timestamp.now(tz="UTC").normalize()).days
         except Exception:
             days_to_earn = None
@@ -373,7 +259,7 @@ def analyze_ticker(
         ext_pct = (latest["Close"] / latest["SMA50"] - 1) * 100
         if ext_pct > 8: score -= 0.5; reasons.append(f"Extended {ext_pct:.1f}% above 50d — score dampened")
 
-    # Relative strength & market regime
+    # Relative strength vs SPY 20d + market regime
     rel20d_pp = None
     spy_regime_ok = True
     try:
@@ -401,7 +287,7 @@ def analyze_ticker(
         if not allowed:
             score -= 1.0; reasons.append(f"Earnings in {days_to_earn}d (blackout)")
 
-    # Cooldown: 3 последователни зелени дни + overextension
+    # Cooldown
     if ext_pct is not None and ext_pct > 8 and len(df) >= 4:
         last3 = df["Close"].pct_change().iloc[-3:] > 0
         if last3.sum() == 3: score -= 0.25; reasons.append("3 green days while extended — cooldown")
@@ -410,35 +296,33 @@ def analyze_ticker(
     sl_mult = cfg.get("sl_atr_mult", 1.5)
     tp_mult = cfg.get("tp_atr_mult", 2.5)
     sl_level = tp_level = None
-    if price is not None and not np.isnan(latest["ATR14"]):
+    if not np.isnan(latest["ATR14"]) and price is not None:
         atr_abs = float(latest["ATR14"])
         sl_level = round(price - sl_mult * atr_abs, 2)
         tp_level = round(price + tp_mult * atr_abs, 2)
         reasons.append(f"ATR-based SL/TP: x{sl_mult} / x{tp_mult}")
 
-    # Map to signal
-    buy_th = cfg["buy_threshold"]
-    sell_th = cfg["sell_threshold"]
+    # Map to signal + guard
+    buy_th, sell_th = cfg["buy_threshold"], cfg["sell_threshold"]
     signal = "HOLD"
     if score >= buy_th: signal = "BUY"
     elif score <= sell_th: signal = "SELL"
 
-    # Buy guard logic (with relax/market guards)
-    vol_threshold = 1.1 if relax_guards else 1.2
+    vol_threshold = 1.2
     rel_ok = (rel20d_pp is not None and rel20d_pp > 0)
-    breakout_vol_ok = (latest["Close"] > latest["High20"] and vol_surge >= vol_threshold)
+    breakout_vol_ok = (latest["Close"] > latest["High20"] and (float(latest["VolSurge"]) if latest["VolSurge"]==latest["VolSurge"] else 0) >= vol_threshold)
     cond2 = breakout_vol_ok or near_high
-    guard_ok = (macd_ok and cond2 and (rel_ok if not relax_guards else True) and (spy_regime_ok if market_guard else True))
+    guard_ok = (macd_ok and cond2 and rel_ok and (spy_regime_ok if market_guard else True))
     if signal == "BUY" and not guard_ok:
         signal = "HOLD"
-        reasons.append("Buy guard failed: need MACD>Signal, RelStr>0 (unless relax), (breakout vol≥thr or near-high), and healthy SPY regime (unless disabled)")
+        reasons.append("Buy guard failed: need MACD>Signal, RelStr>0, (breakout vol≥thr or near-high), and healthy SPY regime")
 
     ibkr_delta = None
     if optional_ibkr_price is not None and optional_ibkr_price > 0 and price:
         ibkr_delta = ((optional_ibkr_price / price) - 1) * 100
         reasons.append(f"IBKR vs YF delta: {ibkr_delta:+.2f}%")
 
-    result.update({
+    res.update({
         "df": df,
         "score": round(float(score), 2),
         "signal": signal,
@@ -457,92 +341,186 @@ def analyze_ticker(
             "ibkr_delta_pct": round(float(ibkr_delta), 2) if ibkr_delta is not None else None,
             "ext_pct": round(float(ext_pct), 2) if ext_pct is not None else None,
             "rel20d_pp": round(float(rel20d_pp), 2) if rel20d_pp is not None else None,
-            "sl": sl_level,
-            "tp": tp_level,
-            "sl_mult": sl_mult,
-            "tp_mult": tp_mult,
+            "sl": sl_level, "tp": tp_level,
+            "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
-            "flags": {
-                "macd_ok": bool(macd_ok),
-                "rel_ok": bool(rel_ok),
-                "near_high": bool(near_high),
-                "breakout_vol_ok": bool(breakout_vol_ok),
-                "spy_regime_ok": bool(spy_regime_ok),
-                "vol_threshold": vol_threshold,
-                "relax": bool(relax_guards),
-            },
+            "flags": {"macd_ok": bool(macd_ok), "rel_ok": bool(rel_ok),
+                      "near_high": bool(near_high), "breakout_vol_ok": bool(breakout_vol_ok),
+                      "spy_regime_ok": bool(spy_regime_ok)},
         },
         "explanations": reasons,
     })
-    return result
-
+    return res
 
 def build_chart(df: pd.DataFrame, title: str, sl: float | None = None, tp: float | None = None) -> 'go.Figure':
     window = min(CHART_WINDOW_DAYS, len(df))
     sub = df.iloc[-window:].copy()
-
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=sub.index,
-        open=sub['Open'], high=sub['High'], low=sub['Low'], close=sub['Close'],
-        name='Price'
-    ))
-
-    if 'SMA50' in sub.columns:
-        fig.add_trace(go.Scatter(x=sub.index, y=sub['SMA50'], name='SMA50', mode='lines'))
-    if 'SMA200' in sub.columns:
-        fig.add_trace(go.Scatter(x=sub.index, y=sub['SMA200'], name='SMA200', mode='lines'))
-
+    fig.add_trace(go.Candlestick(x=sub.index, open=sub['Open'], high=sub['High'], low=sub['Low'], close=sub['Close'], name='Price'))
+    if 'SMA50' in sub.columns:  fig.add_trace(go.Scatter(x=sub.index, y=sub['SMA50'], name='SMA50', mode='lines'))
+    if 'SMA200' in sub.columns: fig.add_trace(go.Scatter(x=sub.index, y=sub['SMA200'], name='SMA200', mode='lines'))
     if 'High20' in sub.columns and 'Low20' in sub.columns:
         fig.add_trace(go.Scatter(x=sub.index, y=sub['High20'], name='20d High', mode='lines'))
-        fig.add_trace(go.Scatter(x=sub.index, y=sub['Low20'], name='20d Low', mode='lines'))
-
+        fig.add_trace(go.Scatter(x=sub.index, y=sub['Low20'],  name='20d Low',  mode='lines'))
     try:
-        if sl is not None:
-            fig.add_hline(y=sl, line_dash="dot", annotation_text="SL", annotation_position="top left")
-        if tp is not None:
-            fig.add_hline(y=tp, line_dash="dot", annotation_text="TP", annotation_position="top left")
+        if sl is not None: fig.add_hline(y=sl, line_dash="dot", annotation_text="SL", annotation_position="top left")
+        if tp is not None: fig.add_hline(y=tp, line_dash="dot", annotation_text="TP", annotation_position="top left")
+    except Exception: pass
+    fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Price", xaxis_rangeslider_visible=False,
+                      height=520, legend_orientation="h", margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+# ---------------- AUTH (username + password via Supabase) ----------------
+def _username_to_email(u: str) -> str:
+    base = slugify((u or "").strip().lower()) or "user"
+    return f"{base}@users.local"
+
+def _logout():
+    try:
+        if sb: sb.auth.sign_out()
+    except Exception:
+        pass
+    for k in ["auth_ok", "auth_user", "auth_uid", "login_fail_count", "login_lock_until"]:
+        st.session_state.pop(k, None)
+    st.experimental_rerun()
+
+def _ensure_profile(uid: str, username: str):
+    try:
+        sb.table("profiles").upsert({"id": uid, "username": username}).execute()
     except Exception:
         pass
 
-    fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Price",
-        xaxis_rangeslider_visible=False,
-        height=520,
-        legend_orientation="h",
-        margin=dict(l=10, r=10, t=40, b=10)
-    )
-    return fig
+def _auth_gate() -> bool:
+    if not sb:
+        st.error("Missing Supabase config. Add SUPABASE_URL and SUPABASE_ANON_KEY in Render → Environment.")
+        st.stop()
 
+    now = time.time()
+    if now < st.session_state.get("login_lock_until", 0):
+        st.warning("Too many failed attempts. Try again later.")
+        return False
+
+    # already signed in?
+    try:
+        u = sb.auth.get_user()
+        if u and u.user:
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_uid"] = u.user.id
+            st.session_state.setdefault("auth_user", u.user.user_metadata.get("username", "user"))
+    except Exception:
+        pass
+
+    if st.session_state.get("auth_ok"):
+        with st.sidebar:
+            st.markdown(f"**Signed in:** {st.session_state.get('auth_user')}")
+            if st.button("Logout"):
+                _logout()
+        return True
+
+    tabs = st.tabs(["Sign in", "Create profile"])
+
+    with tabs[0]:
+        u = st.text_input("Username", key="login_user")
+        p = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Sign in", key="btn_login"):
+            try:
+                email = _username_to_email(u)
+                sess = sb.auth.sign_in_with_password({"email": email, "password": p})
+                if sess and sess.user:
+                    st.session_state["auth_ok"] = True
+                    st.session_state["auth_uid"] = sess.user.id
+                    st.session_state["auth_user"] = (u or "").strip()
+                    st.session_state.pop("login_fail_count", None)
+                    st.session_state.pop("login_lock_until", None)
+                    _ensure_profile(sess.user.id, (u or "").strip())
+                    st.experimental_rerun()
+                else:
+                    raise Exception("no session")
+            except Exception:
+                fails = st.session_state.get("login_fail_count", 0) + 1
+                st.session_state["login_fail_count"] = fails
+                if fails >= 5:
+                    st.session_state["login_lock_until"] = time.time() + 10 * 60
+                st.error("Invalid username or password.")
+
+    with tabs[1]:
+        nu = st.text_input("Username (min 3 chars)", key="reg_user")
+        npw = st.text_input("Password (min 8 chars)", type="password", key="reg_pass")
+        nc  = st.text_input("Confirm password", type="password", key="reg_conf")
+        if st.button("Create profile", key="btn_register"):
+            uname = (nu or "").strip()
+            if len(slugify(uname)) < 3:
+                st.error("Username too short."); st.stop()
+            if len(npw) < 8:
+                st.error("Password too short."); st.stop()
+            if npw != nc:
+                st.error("Passwords do not match."); st.stop()
+            email = _username_to_email(uname)
+            try:
+                res = sb.auth.sign_up({"email": email, "password": npw, "options": {"data": {"username": uname}}})
+                if not res or not res.user:
+                    st.error("Could not create profile."); st.stop()
+                sess = sb.auth.sign_in_with_password({"email": email, "password": npw})
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_uid"] = sess.user.id
+                st.session_state["auth_user"] = uname
+                _ensure_profile(sess.user.id, uname)
+                st.success("Profile created.")
+                st.experimental_rerun()
+            except Exception:
+                st.error("Username may be taken. Try another.")
+                st.stop()
+
+    st.stop()
+
+# ---------------- Persistence via Supabase ----------------
+def _session_uid() -> str | None:
+    return st.session_state.get("auth_uid")
+
+def load_watchlist() -> Dict[str, Any]:
+    default = {"tickers": DEFAULT_TICKERS, "profile": DEFAULT_PROFILE,
+               "auto_refresh_minutes": 15, "acct_size": 10000.0, "risk_pct": 1.0}
+    uid = _session_uid()
+    if not uid: return default
+    skey = f"watchlist_state__{uid}"
+    if skey in st.session_state:
+        return st.session_state[skey]
+    try:
+        res = sb.table("watchlists").select("data").eq("user_id", uid).single().execute()
+        data = (res.data or {}).get("data", None)
+        st.session_state[skey] = data if isinstance(data, dict) else default
+    except Exception:
+        st.session_state[skey] = default
+    return st.session_state[skey]
+
+def save_watchlist(state: Dict[str, Any]) -> None:
+    uid = _session_uid()
+    if not uid: return
+    skey = f"watchlist_state__{uid}"
+    st.session_state[skey] = state
+    try:
+        sb.table("watchlists").upsert({
+            "user_id": uid,
+            "data": state,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }).execute()
+    except Exception:
+        pass
 
 # ---------------- UI ----------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-# Guard missing yfinance
-if yf is None:
-    st.error("Missing dependency: 'yfinance'. Add a requirements.txt with the packages below, then Clear cache → Rerun.")
-    st.code("""streamlit
-yfinance
-pandas
-numpy
-plotly
-streamlit-autorefresh
-""", language="text")
+# Gate: Supabase auth first
+if not _auth_gate():
     st.stop()
 
-# Guard missing plotly
+# Guards for missing libs
+if yf is None:
+    st.error("Missing dependency: 'yfinance'. Add it to requirements.txt.")
+    st.stop()
 if go is None:
-    st.error("Missing dependency: 'plotly'. Add it to requirements.txt, then Clear cache → Rerun.")
-    st.code("""streamlit
-yfinance
-pandas
-numpy
-plotly
-streamlit-autorefresh
-""", language="text")
+    st.error("Missing dependency: 'plotly'. Add it to requirements.txt.")
     st.stop()
 
 state = load_watchlist()
@@ -578,20 +556,20 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📏 Position sizing")
     acct_size = st.number_input("Account size ($)", min_value=0.0, value=float(state.get("acct_size", 10000.0)), step=100.0)
-    risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=float(state.get("risk_pct", 1.0)), step=0.1)
+    risk_pct  = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=float(state.get("risk_pct", 1.0)), step=0.1)
 
     st.markdown("---")
     st.subheader("🔒 Buy-guard & stops")
     relax_guards = st.checkbox("Relax guards (test mode)", value=bool(state.get("relax_guards", False)))
     market_guard = st.checkbox("Enforce SPY regime", value=bool(state.get("market_guard", True)))
-    ts_enabled = st.checkbox("Use trailing stop instead of fixed SL", value=bool(state.get("ts_enabled", False)))
-    ts_mult = st.number_input("Trailing stop ATR multiple", min_value=0.5, max_value=5.0, value=float(state.get("ts_mult", 1.5)), step=0.1)
+    ts_enabled   = st.checkbox("Use trailing stop instead of fixed SL", value=bool(state.get("ts_enabled", False)))
+    ts_mult      = st.number_input("Trailing stop ATR multiple", min_value=0.5, max_value=5.0, value=float(state.get("ts_mult", 1.5)), step=0.1)
 
     if st.button("💾 Save settings"):
         state["profile"] = profile
         state["auto_refresh_minutes"] = int(auto_minutes)
         state["acct_size"] = float(acct_size)
-        state["risk_pct"] = float(risk_pct)
+        state["risk_pct"]  = float(risk_pct)
         state["relax_guards"] = bool(relax_guards)
         state["market_guard"] = bool(market_guard)
         state["ts_enabled"] = bool(ts_enabled)
@@ -599,14 +577,10 @@ with st.sidebar:
         save_watchlist(state)
         st.toast("Settings saved", icon="✅")
 
-# Auto refresh (if plugin available)
-if state.get("auto_refresh_minutes", 15) > 0:
-    if HAS_AUTOR:
-        st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
-    else:
-        st.info("Auto-refresh unavailable (install 'streamlit-autorefresh') or use the Refresh button.")
+# Auto refresh
+if state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
+    st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
 
-# Manual refresh fallback
 with st.sidebar:
     if st.button("🔄 Refresh now"):
         st.experimental_rerun()
@@ -620,11 +594,11 @@ if not watch:
 st.write(f"**Profile:** {profile}  •  **Tickers:** {', '.join(watch)}")
 
 acct_size = float(state.get("acct_size", 10000.0))
-risk_pct = float(state.get("risk_pct", 1.0))
+risk_pct  = float(state.get("risk_pct", 1.0))
 relax_guards = bool(state.get("relax_guards", False))
 market_guard = bool(state.get("market_guard", True))
-ts_enabled = bool(state.get("ts_enabled", False))
-ts_mult = float(state.get("ts_mult", 1.5))
+ts_enabled   = bool(state.get("ts_enabled", False))
+ts_mult      = float(state.get("ts_mult", 1.5))
 
 with st.expander("Optional: IBKR Last Prices (manual to compare deltas)"):
     ibkr_inputs: Dict[str, float | None] = {}
@@ -641,7 +615,8 @@ with st.expander("Optional: IBKR Last Prices (manual to compare deltas)"):
 results: List[Dict[str, Any]] = []
 with st.spinner("Analyzing tickers…"):
     for t in watch:
-        res = analyze_ticker(t, profile, optional_ibkr_price=ibkr_inputs.get(t), relax_guards=relax_guards, market_guard=market_guard)
+        res = analyze_ticker(t, profile, optional_ibkr_price=ibkr_inputs.get(t),
+                             relax_guards=relax_guards, market_guard=market_guard)
         results.append(res)
 
 # Summary table
@@ -652,22 +627,14 @@ for r in results:
         continue
     m = r.get("metrics", {})
     rows.append({
-        "Ticker": r["ticker"],
-        "Signal": r.get("signal"),
-        "Score": r.get("score"),
-        "Price": m.get("price"),
-        "Δ 1D %": m.get("change_pct"),
-        "RSI14": m.get("rsi14"),
+        "Ticker": r["ticker"], "Signal": r.get("signal"), "Score": r.get("score"),
+        "Price": m.get("price"), "Δ 1D %": m.get("change_pct"), "RSI14": m.get("rsi14"),
         "MACD>Sig": 1 if (m.get("macd") or 0) > (m.get("macd_signal") or 0) else 0,
-        "Vol xAvg20": m.get("vol_surge"),
-        "ATR %": m.get("atr_pct"),
-        "Ext%50d": m.get("ext_pct"),
-        "RelStr20d(pp)": m.get("rel20d_pp"),
+        "Vol xAvg20": m.get("vol_surge"), "ATR %": m.get("atr_pct"),
+        "Ext%50d": m.get("ext_pct"), "RelStr20d(pp)": m.get("rel20d_pp"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
-        "SL": m.get("sl"),
-        "TP": m.get("tp"),
-        "Days→Earn": m.get("days_to_earnings"),
-        "IBKR Δ%": m.get("ibkr_delta_pct"),
+        "SL": m.get("sl"), "TP": m.get("tp"),
+        "Days→Earn": m.get("days_to_earnings"), "IBKR Δ%": m.get("ibkr_delta_pct"),
     })
 
 summary_df = pd.DataFrame(rows)
@@ -680,26 +647,16 @@ st.dataframe(summary_df, use_container_width=True, hide_index=True)
 # Downloads
 col_dl1, col_dl2 = st.columns(2)
 with col_dl1:
-    st.download_button(
-        label="⬇️ Download table (CSV)",
+    st.download_button("⬇️ Download table (CSV)",
         data=summary_df.to_csv(index=False).encode("utf-8"),
-        file_name="watchlist_signals.csv",
-        mime="text/csv",
-    )
+        file_name="watchlist_signals.csv", mime="text/csv")
 with col_dl2:
-    diag = [{
-        "ticker": r["ticker"],
-        "score": r.get("score"),
-        "signal": r.get("signal"),
-        "metrics": r.get("metrics"),
-        "explanations": r.get("explanations"),
-    } for r in results]
-    st.download_button(
-        label="⬇️ Download diagnostics (JSON)",
+    diag = [{"ticker": r["ticker"], "score": r.get("score"),
+             "signal": r.get("signal"), "metrics": r.get("metrics"),
+             "explanations": r.get("explanations")} for r in results]
+    st.download_button("⬇️ Download diagnostics (JSON)",
         data=json.dumps(diag, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name="watchlist_diagnostics.json",
-        mime="application/json",
-    )
+        file_name="watchlist_diagnostics.json", mime="application/json")
 
 # Per-ticker details
 st.markdown("---")
@@ -707,9 +664,7 @@ for r in results:
     t = r["ticker"]
     st.markdown(f"## {t} · Signal: **{r['signal']}** · Score: **{r['score']}**")
     if r.get("error"):
-        st.warning(r.get("error"))
-        continue
-
+        st.warning(r.get("error")); continue
     m = r.get("metrics", {})
     left, right = st.columns([2, 1])
     with left:
@@ -733,18 +688,14 @@ for r in results:
     with st.expander("📋 IBKR order (copy)"):
         side_default = 0 if r.get("signal") == "BUY" else 1
         side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{t}")
-        entry = m.get("price")
-        atr_abs = m.get("atr14")
-        sl_mult = m.get("sl_mult")
-        tp_mult = m.get("tp_mult")
+        entry = m.get("price"); atr_abs = m.get("atr14")
+        sl_mult = m.get("sl_mult"); tp_mult = m.get("tp_mult")
         if entry is not None and atr_abs is not None and sl_mult is not None and tp_mult is not None:
-            # TP stays ATR-based
             ord_tp = round(entry + tp_mult * atr_abs, 2) if side == "BUY" else round(entry - tp_mult * atr_abs, 2)
-            # Choose SL (fixed or trailing)
-            if ts_enabled:
-                trail_amt = round(ts_mult * atr_abs, 2)
+            if state.get("ts_enabled", False):
+                trail_amt = round(state.get("ts_mult", 1.5) * atr_abs, 2)
                 risk_per_share = trail_amt
-                qty = int(max(1, np.floor((acct_size * risk_pct / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
+                qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
                 order_text = f"""IBKR Bracket Order
 Symbol: {t}
 Side: {side}
@@ -753,13 +704,13 @@ Parent: LIMIT {side} @ {entry:.2f}
 Child 1: TRAILING STOP {'SELL' if side=='BUY' else 'BUY TO COVER'} trail_amt ${trail_amt:.2f}
 Child 2: TAKE-PROFIT LIMIT {'SELL' if side=='BUY' else 'BUY TO COVER'} @ {ord_tp:.2f}
 Risk/share (≈trail): ${risk_per_share:.2f}
-Risk amount ({risk_pct:.2f}% of ${acct_size:.2f}): ${acct_size * risk_pct / 100.0:.2f}
+Risk amount ({state.get('risk_pct',1.0):.2f}% of ${state.get('acct_size',10000.0):.2f}): ${state.get('acct_size',10000.0) * state.get('risk_pct',1.0) / 100.0:.2f}
 Note: R:R is approximate with trailing stops.
 """
             else:
                 ord_sl = round(entry - sl_mult * atr_abs, 2) if side == "BUY" else round(entry + sl_mult * atr_abs, 2)
                 risk_per_share = abs(entry - ord_sl)
-                qty = int(max(1, np.floor((acct_size * risk_pct / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
+                qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
                 rr = (abs(ord_tp - entry) / risk_per_share) if risk_per_share > 0 else None
                 order_text = f"""IBKR Bracket Order
 Symbol: {t}
@@ -769,8 +720,8 @@ Parent: LIMIT {side} @ {entry:.2f}
 Child 1: STOP {'SELL' if side=='BUY' else 'BUY TO COVER'} @ {ord_sl:.2f}
 Child 2: TAKE-PROFIT LIMIT {'SELL' if side=='BUY' else 'BUY TO COVER'} @ {ord_tp:.2f}
 Risk/share: ${risk_per_share:.2f}
-Risk amount ({risk_pct:.2f}% of ${acct_size:.2f}): ${acct_size * risk_pct / 100.0:.2f}
-Approx. R:R: {rr:.2f}
+Risk amount ({state.get('risk_pct',1.0):.2f}% of ${state.get('acct_size',10000.0):.2f}): ${state.get('acct_size',10000.0) * state.get('risk_pct',1.0) / 100.0:.2f}
+Approx. R:R: {rr:.2f if rr is not None else 'n/a'}
 """
             st.code(order_text, language="text")
         else:
@@ -781,13 +732,11 @@ Approx. R:R: {rr:.2f}
         def b(v): return "✅" if v else "❌"
         st.write(f"MACD>Signal: {b(flags.get('macd_ok'))}")
         st.write(f"RelStr20d>0: {b(flags.get('rel_ok'))} (val: {m.get('rel20d_pp')})")
-        st.write(f"Breakout vol≥{flags.get('vol_threshold')} or NearHigh: {b(flags.get('breakout_vol_ok') or flags.get('near_high'))} (vol xAvg20: {m.get('vol_surge')})")
+        st.write(f"Breakout vol or NearHigh: {b(flags.get('breakout_vol_ok') or flags.get('near_high'))} (vol xAvg20: {m.get('vol_surge')})")
         st.write(f"SPY regime OK: {b(flags.get('spy_regime_ok'))}")
-        if flags.get('relax'):
-            st.caption("Relax guards: ON (test mode)")
 
     with st.expander("🤖 Why this signal?"):
         for reason in r.get("explanations", []):
             st.write("• ", reason)
 
-st.caption("Signals are computed from simple, explainable rules. Educational use only — not financial advice.")
+st.caption("Educational use only — not financial advice.")
