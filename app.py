@@ -738,7 +738,7 @@ Approx. R:R: {rr_text}
 """
 
         st.code(order_text, language="text")
-        else:
+    else:
         st.info("Not enough data to compute ATR-based SL/TP.")
 
 
