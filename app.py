@@ -686,17 +686,19 @@ for r in results:
             st.text(f"IBKR Δ%: {m.get('ibkr_delta_pct')}%")
 
     with st.expander("📋 IBKR order (copy)"):
-        side_default = 0 if r.get("signal") == "BUY" else 1
-        side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{t}")
-        entry = m.get("price"); atr_abs = m.get("atr14")
-        sl_mult = m.get("sl_mult"); tp_mult = m.get("tp_mult")
-        if entry is not None and atr_abs is not None and sl_mult is not None and tp_mult is not None:
-            ord_tp = round(entry + tp_mult * atr_abs, 2) if side == "BUY" else round(entry - tp_mult * atr_abs, 2)
-            if state.get("ts_enabled", False):
-                trail_amt = round(state.get("ts_mult", 1.5) * atr_abs, 2)
-                risk_per_share = trail_amt
-                qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
-                order_text = f"""IBKR Bracket Order
+    side_default = 0 if r.get("signal") == "BUY" else 1
+    side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{t}")
+    entry = m.get("price"); atr_abs = m.get("atr14")
+    sl_mult = m.get("sl_mult"); tp_mult = m.get("tp_mult")
+
+    if entry is not None and atr_abs is not None and sl_mult is not None and tp_mult is not None:
+        ord_tp = round(entry + tp_mult * atr_abs, 2) if side == "BUY" else round(entry - tp_mult * atr_abs, 2)
+
+        if state.get("ts_enabled", False):
+            trail_amt = round(state.get("ts_mult", 1.5) * atr_abs, 2)
+            risk_per_share = trail_amt
+            qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
+            order_text = f"""IBKR Bracket Order
 Symbol: {t}
 Side: {side}
 Quantity: {qty}
@@ -707,12 +709,14 @@ Risk/share (≈trail): ${risk_per_share:.2f}
 Risk amount ({state.get('risk_pct',1.0):.2f}% of ${state.get('acct_size',10000.0):.2f}): ${state.get('acct_size',10000.0) * state.get('risk_pct',1.0) / 100.0:.2f}
 Note: R:R is approximate with trailing stops.
 """
-            else:
-                ord_sl = round(entry - sl_mult * atr_abs, 2) if side == "BUY" else round(entry + sl_mult * atr_abs, 2)
-                risk_per_share = abs(entry - ord_sl)
-                qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
-                rr = (abs(ord_tp - entry) / risk_per_share) if risk_per_share > 0 else None
-                order_text = f"""IBKR Bracket Order
+        else:
+            ord_sl = round(entry - sl_mult * atr_abs, 2) if side == "BUY" else round(entry + sl_mult * atr_abs, 2)
+            risk_per_share = abs(entry - ord_sl)
+            qty = int(max(1, np.floor((state.get("acct_size", 10000.0) * state.get("risk_pct", 1.0) / 100.0) / risk_per_share))) if risk_per_share > 0 else 0
+            rr = (abs(ord_tp - entry) / risk_per_share) if risk_per_share and risk_per_share > 0 else None
+            rr_text = f"{rr:.2f}" if isinstance(rr, (int, float)) else "n/a"
+
+            order_text = f"""IBKR Bracket Order
 Symbol: {t}
 Side: {side}
 Quantity: {qty}
@@ -721,11 +725,12 @@ Child 1: STOP {'SELL' if side=='BUY' else 'BUY TO COVER'} @ {ord_sl:.2f}
 Child 2: TAKE-PROFIT LIMIT {'SELL' if side=='BUY' else 'BUY TO COVER'} @ {ord_tp:.2f}
 Risk/share: ${risk_per_share:.2f}
 Risk amount ({state.get('risk_pct',1.0):.2f}% of ${state.get('acct_size',10000.0):.2f}): ${state.get('acct_size',10000.0) * state.get('risk_pct',1.0) / 100.0:.2f}
-Approx. R:R: {rr:.2f if rr is not None else 'n/a'}
+Approx. R:R: {rr_text}
 """
-            st.code(order_text, language="text")
-        else:
-            st.info("Not enough data to compute ATR-based SL/TP.")
+        st.code(order_text, language="text")
+    else:
+        st.info("Not enough data to compute ATR-based SL/TP.")
+
 
     with st.expander("🔍 BuyGuard checks"):
         flags = m.get("flags", {})
