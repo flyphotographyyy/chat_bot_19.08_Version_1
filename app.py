@@ -167,6 +167,19 @@ def fetch_spy() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+# Fetch weekly historical data for backtesting and multi‑timeframe analysis.
+# The period parameter is expressed in years to ensure enough data for long
+# moving averages. Using Streamlit's cache to avoid repeated downloads.
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_history_weekly(ticker: str, years: int = 3) -> pd.DataFrame:
+    try:
+        # Period must be specified as string e.g. '3y' for yfinance
+        period_str = f"{years}y"
+        df = yf.download(ticker, period=period_str, interval="1wk", progress=False)
+        return df.dropna() if df is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
 # ---------------- Scoring ----------------
 def analyze_ticker(
     ticker: str,
@@ -265,6 +278,93 @@ def analyze_ticker(
     score = 0.0
     reasons: List[str] = []
 
+    # ---------------------------------------------------------------------
+    # Fundamental analysis
+    # Pull select fundamentals such as trailing P/E, forward P/E, profit margin
+    # and return on equity (ROE).  These values are used to provide context on
+    # how expensive or profitable the company is compared to peers.  Some
+    # heuristic scoring is applied: low P/E or high profit margins add to
+    # confidence, while extremely high P/E or negative margins detract.  All
+    # values are recorded in the metrics for display in the UI.
+    fundamentals = info_blob.get("info", {}) if isinstance(info_blob, dict) else {}
+    pe_ratio: float | None = None
+    forward_pe: float | None = None
+    profit_margin: float | None = None
+    roe: float | None = None
+    try:
+        pe_ratio = float(fundamentals.get("trailingPE")) if fundamentals.get("trailingPE") is not None else None
+    except Exception:
+        pe_ratio = None
+    try:
+        forward_pe = float(fundamentals.get("forwardPE")) if fundamentals.get("forwardPE") is not None else None
+    except Exception:
+        forward_pe = None
+    try:
+        pm = fundamentals.get("profitMargins")
+        # yfinance may return None or nan; ensure numeric
+        if pm is not None and not isinstance(pm, (list, dict)):
+            profit_margin = float(pm)
+    except Exception:
+        profit_margin = None
+    try:
+        ro = fundamentals.get("returnOnEquity")
+        if ro is not None and not isinstance(ro, (list, dict)):
+            roe = float(ro)
+    except Exception:
+        roe = None
+
+    # Apply fundamental heuristics to score
+    if profit_margin is not None:
+        # Profit margins expressed as decimal (e.g. 0.25 = 25%).  High margins suggest
+        # strong competitive position and pricing power, while negative margins
+        # signal an unprofitable business.
+        if profit_margin > 0.2:
+            score += 0.5
+            reasons.append(f"High profit margin {profit_margin*100:.1f}%")
+        elif profit_margin > 0:
+            score += 0.25
+            reasons.append(f"Positive profit margin {profit_margin*100:.1f}%")
+        else:
+            score -= 0.25
+            reasons.append(f"Negative profit margin {profit_margin*100:.1f}%")
+    if pe_ratio is not None:
+        # P/E ratio: lower values (relative to broad market/sector) imply a cheaper
+        # valuation.  Moderate P/E around 15‑25 is neutral to mildly positive.
+        if pe_ratio < 15:
+            score += 0.5
+            reasons.append(f"Low P/E {pe_ratio:.1f}")
+        elif pe_ratio < 25:
+            score += 0.25
+            reasons.append(f"Moderate P/E {pe_ratio:.1f}")
+        elif pe_ratio > 40:
+            score -= 0.5
+            reasons.append(f"Very high P/E {pe_ratio:.1f}")
+        elif pe_ratio > 30:
+            score -= 0.25
+            reasons.append(f"Elevated P/E {pe_ratio:.1f}")
+    if forward_pe is not None and pe_ratio is not None:
+        # Compare forward P/E to trailing P/E.  A lower forward P/E suggests expected
+        # earnings growth and may be favourable.
+        try:
+            if forward_pe < pe_ratio:
+                score += 0.25
+                reasons.append(f"Forward P/E ({forward_pe:.1f}) < trailing P/E")
+            elif forward_pe > pe_ratio * 1.2:
+                score -= 0.25
+                reasons.append(f"Forward P/E ({forward_pe:.1f}) > trailing P/E")
+        except Exception:
+            pass
+    if roe is not None:
+        # Return on equity indicates how effectively management is using shareholders'
+        # capital.  Values above ~15% are generally considered strong.
+        if roe > 0.15:
+            score += 0.3
+            reasons.append(f"ROE strong {roe*100:.1f}%")
+        elif roe < 0.05:
+            score -= 0.3
+            reasons.append(f"ROE weak {roe*100:.1f}%")
+    # ---------------------------------------------------------------------
+
     # Trend
     if latest["Close"] > latest["SMA50"]: score += 1.0; reasons.append("Price > SMA50 (trend up)")
     else: score -= 0.5; reasons.append("Price < SMA50 (trend weak)")
@@ -282,8 +382,9 @@ def analyze_ticker(
     # Multi‑timeframe confirmation: compare weekly SMA10 vs SMA40
     # This helps gauge the broader trend and reduces false positives.
     try:
-        # Fetch approximately 3 years of weekly data (to have at least 40 weeks)
-        raw_weekly = yf.download(ticker, period="3y", interval="1wk", progress=False)
+        # Fetch weekly history via cached helper (approx. 3 years).  Using our
+        # caching layer avoids repeated API calls when analyzing multiple tickers.
+        raw_weekly = fetch_history_weekly(ticker, years=3)
         if raw_weekly is not None and not raw_weekly.empty:
             # Use _pick_series to gracefully handle MultiIndex columns
             weekly_close = _pick_series(raw_weekly, ["Adj Close", "Close"]).dropna()
@@ -435,6 +536,66 @@ def analyze_ticker(
     except Exception:
         bb_width_ratio = None
 
+    # ---------------------------------------------------------------------
+    # Simple historical backtesting
+    # To gauge how the strategy would have performed recently, run a simplified
+    # backtest over the last ~120 days.  A buy signal is generated when
+    # price is above both the 50d and 200d SMAs, the 50d SMA is above the
+    # 200d SMA (bullish structure), MACD line exceeds its signal, and RSI
+    # remains below the configured upper bound.  Returns are measured after
+    # a fixed holding period (10 days).  We compute the win rate and
+    # average return of these trades and apply modest adjustments to the
+    # overall score.  These metrics are stored in the result for display.
+    backtest_win = None
+    backtest_avg = None
+    backtest_count = 0
+    try:
+        hold_days = 10
+        back_returns: List[float] = []
+        # Limit lookback to the most recent 120 days to emphasize recent market
+        # conditions.  Skip earlier rows when the dataset is longer.
+        lookback_window = 120
+        for idx in range(max(0, len(df) - lookback_window), len(df) - hold_days):
+            row = df.iloc[idx]
+            # Ensure SMA columns are present and not NaN
+            if (not np.isnan(row.get("SMA50", np.nan)) and
+                not np.isnan(row.get("SMA200", np.nan)) and
+                row["Close"] > row["SMA50"] and
+                row["Close"] > row["SMA200"] and
+                row["SMA50"] > row["SMA200"] and
+                row["MACD"] > row["MACD_signal"] and
+                row["RSI14"] < cfg.get("rsi_upper", 70)):
+                future_index = idx + hold_days
+                if future_index < len(df):
+                    ret = (df["Close"].iloc[future_index] / row["Close"]) - 1
+                    back_returns.append(float(ret))
+        backtest_count = len(back_returns)
+        if back_returns:
+            backtest_win = float(sum(1 for x in back_returns if x > 0) / len(back_returns))
+            backtest_avg = float(np.mean(back_returns))
+            reasons.append(
+                f"Backtest win rate {backtest_win*100:.0f}% (avg {backtest_avg*100:.2f}%)"
+            )
+            # Score adjustments based on backtest success metrics
+            if backtest_win > 0.6:
+                score += 0.5
+            elif backtest_win > 0.5:
+                score += 0.25
+            elif backtest_win < 0.4:
+                score -= 0.5
+            elif backtest_win < 0.5:
+                score -= 0.25
+            if backtest_avg > 0.05:
+                score += 0.5
+            elif backtest_avg > 0.02:
+                score += 0.25
+            elif backtest_avg < 0:
+                score -= 0.25
+    except Exception:
+        backtest_win = None
+        backtest_avg = None
+        backtest_count = 0
+
     # ATR-based SL/TP
     sl_mult = cfg.get("sl_atr_mult", 1.5)
     tp_mult = cfg.get("tp_atr_mult", 2.5)
@@ -503,6 +664,16 @@ def analyze_ticker(
             "bb_pos": round(float(bb_pos), 2) if bb_pos is not None else None,
             "bb_width": round(float(bb_width_ratio), 3) if bb_width_ratio is not None else None,
             "bb_width_pct": round(float(bb_width_ratio) * 100, 2) if bb_width_ratio is not None else None,
+            # Fundamental metrics
+            "pe_ratio": round(float(pe_ratio), 2) if pe_ratio is not None else None,
+            "forward_pe": round(float(forward_pe), 2) if forward_pe is not None else None,
+            # Profit margin and ROE are expressed as percentages for readability
+            "profit_margin_pct": round(profit_margin * 100, 2) if profit_margin is not None else None,
+            "roe_pct": round(roe * 100, 2) if roe is not None else None,
+            # Backtest summary
+            "backtest_win_rate_pct": round(backtest_win * 100, 1) if backtest_win is not None else None,
+            "backtest_avg_return_pct": round(backtest_avg * 100, 2) if backtest_avg is not None else None,
+            "backtest_signals": backtest_count,
             "sl": sl_level, "tp": tp_level,
             "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
@@ -820,6 +991,12 @@ for r in results:
         "BB pos": m.get("bb_pos"),
         "BB width (%)": m.get("bb_width_pct"),
         "RelStr20d(pp)": m.get("rel20d_pp"),
+        "PE": m.get("pe_ratio"),
+        "PM %": m.get("profit_margin_pct"),
+        "ROE %": m.get("roe_pct"),
+        "BT Win %": m.get("backtest_win_rate_pct"),
+        "BT Avg %": m.get("backtest_avg_return_pct"),
+        "BT Count": m.get("backtest_signals"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
         "SL": m.get("sl"),
         "TP": m.get("tp"),
@@ -883,6 +1060,20 @@ for r in results:
         st.text(f"Days→Earnings: {m.get('days_to_earnings')}")
         if m.get("ibkr_delta_pct") is not None:
             st.text(f"IBKR Δ%: {m.get('ibkr_delta_pct')}%")
+
+        # Display select fundamental metrics and backtest summary
+        if m.get("pe_ratio") is not None:
+            st.text(f"P/E ratio: {m.get('pe_ratio')}")
+        if m.get("profit_margin_pct") is not None:
+            st.text(f"Profit margin: {m.get('profit_margin_pct')}%")
+        if m.get("roe_pct") is not None:
+            st.text(f"ROE: {m.get('roe_pct')}%")
+        if m.get("backtest_win_rate_pct") is not None:
+            st.text(f"BT win rate: {m.get('backtest_win_rate_pct')}%")
+        if m.get("backtest_avg_return_pct") is not None:
+            st.text(f"BT avg return: {m.get('backtest_avg_return_pct')}%")
+        if m.get("backtest_signals") is not None and int(m.get("backtest_signals")) > 0:
+            st.text(f"BT signals: {m.get('backtest_signals')}")
 
     # --------- FIXED BLOCK (correct indentation + safe formatting) ----------
     with st.expander("📋 IBKR order (copy)"):
