@@ -1,8 +1,8 @@
 # app.py  — Streamlit Watchlist Swing-Assistant + Supabase auth (username+password)
 # -------------------------------------------------------------------------------
-# Запазен UI/логика; добавени:
-# - Вход/регистрация с username+парола (без имейли за потребителя)
-# - Данните (watchlist/настройки) се пазят в Supabase -> не изисква платен диск на Render
+# Запазен UI/логика; поправки:
+# - st.experimental_rerun -> st.rerun (Streamlit 1.30+)
+# - Login/Register през st.form + form_submit_button (фиксира „натисни 2 пъти“)
 
 from __future__ import annotations
 import json, os, time
@@ -381,7 +381,7 @@ def _logout():
         pass
     for k in ["auth_ok", "auth_user", "auth_uid", "login_fail_count", "login_lock_until"]:
         st.session_state.pop(k, None)
-    st.experimental_rerun()
+    st.rerun()  # <- fixed
 
 def _ensure_profile(uid: str, username: str):
     try:
@@ -418,10 +418,13 @@ def _auth_gate() -> bool:
 
     tabs = st.tabs(["Sign in", "Create profile"])
 
+    # -------- LOGIN FORM (prevents double-click) --------
     with tabs[0]:
-        u = st.text_input("Username", key="login_user")
-        p = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Sign in", key="btn_login"):
+        with st.form("login_form"):
+            u = st.text_input("Username", key="login_user")
+            p = st.text_input("Password", type="password", key="login_pass")
+            submitted_login = st.form_submit_button("Sign in")
+        if submitted_login:
             try:
                 email = _username_to_email(u)
                 sess = sb.auth.sign_in_with_password({"email": email, "password": p})
@@ -432,7 +435,7 @@ def _auth_gate() -> bool:
                     st.session_state.pop("login_fail_count", None)
                     st.session_state.pop("login_lock_until", None)
                     _ensure_profile(sess.user.id, (u or "").strip())
-                    st.experimental_rerun()
+                    st.rerun()  # <- fixed
                 else:
                     raise Exception("no session")
             except Exception:
@@ -442,11 +445,14 @@ def _auth_gate() -> bool:
                     st.session_state["login_lock_until"] = time.time() + 10 * 60
                 st.error("Invalid username or password.")
 
+    # -------- REGISTER FORM --------
     with tabs[1]:
-        nu = st.text_input("Username (min 3 chars)", key="reg_user")
-        npw = st.text_input("Password (min 8 chars)", type="password", key="reg_pass")
-        nc  = st.text_input("Confirm password", type="password", key="reg_conf")
-        if st.button("Create profile", key="btn_register"):
+        with st.form("register_form"):
+            nu = st.text_input("Username (min 3 chars)", key="reg_user")
+            npw = st.text_input("Password (min 8 chars)", type="password", key="reg_pass")
+            nc  = st.text_input("Confirm password", type="password", key="reg_conf")
+            submitted_reg = st.form_submit_button("Create profile")
+        if submitted_reg:
             uname = (nu or "").strip()
             if len(slugify(uname)) < 3:
                 st.error("Username too short."); st.stop()
@@ -465,7 +471,7 @@ def _auth_gate() -> bool:
                 st.session_state["auth_user"] = uname
                 _ensure_profile(sess.user.id, uname)
                 st.success("Profile created.")
-                st.experimental_rerun()
+                st.rerun()  # <- fixed
             except Exception:
                 st.error("Username may be taken. Try another.")
                 st.stop()
@@ -582,7 +588,7 @@ if state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
 
 with st.sidebar:
     if st.button("🔄 Refresh now"):
-        st.experimental_rerun()
+        st.rerun()  # <- fixed
 
 # Main
 watch = state.get("tickers", [])
