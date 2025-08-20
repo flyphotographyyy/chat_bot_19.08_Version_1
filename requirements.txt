@@ -13,3 +13,6 @@ realtime>=2.5
 # за username нормализация (ползва се в app.py)
 python-slugify==8.0.4
 
+# ML библиотека за етап 2 “ML Lite”
+scikit-learn==1.1.3
+
