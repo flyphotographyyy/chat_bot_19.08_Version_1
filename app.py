@@ -30,17 +30,6 @@ try:
 except Exception:
     HAS_AUTOR = False
 
-# Optional ML dependencies.  We use scikit‑learn to build a simple
-# logistic regression model that estimates the probability of a positive
-# return over a fixed holding period.  If scikit‑learn is not
-# installed, the ML step will be skipped gracefully.
-try:
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
-except Exception:
-    LogisticRegression = None
-    StandardScaler = None
-
 # --- Supabase (free, no disk needed) ---
 from slugify import slugify
 from supabase import create_client, Client
@@ -120,6 +109,99 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low_close  = (df['Low']  - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+# -----------------------------------------------------------------------------
+# Logistic regression helpers (pure NumPy)
+#
+# To avoid dependencies on compiled libraries such as scikit‑learn, we implement
+# a simple logistic regression model using gradient descent and feature
+# standardization.  These helper functions standardize the data, train the
+# coefficients, and compute probabilities for new observations.  The model is
+# used to generate a meta‑signal probability in the analyze_ticker function.
+
+def _standardize_features(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Standardize features by subtracting the mean and dividing by the
+    standard deviation.  Returns the standardized array along with the
+    means and stds (to reuse for new samples).
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Raw feature matrix.
+
+    Returns
+    -------
+    X_std : np.ndarray
+        Standardized feature matrix.
+    mean : np.ndarray
+        Per-feature means.
+    std : np.ndarray
+        Per-feature standard deviations with zeros replaced by one.
+    """
+    mean = np.nanmean(X, axis=0)
+    std = np.nanstd(X, axis=0)
+    # Replace zeros with ones to avoid division by zero
+    std_safe = np.where(std == 0, 1, std)
+    X_std = (X - mean) / std_safe
+    return X_std, mean, std_safe
+
+def _train_logistic_numpy(X: np.ndarray, y: np.ndarray, lr: float = 0.05,
+                          n_iter: int = 200) -> Tuple[np.ndarray, float]:
+    """
+    Train a logistic regression model using gradient descent.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Standardized feature matrix (n_samples x n_features).
+    y : np.ndarray
+        Binary target labels (0 or 1).
+    lr : float, optional
+        Learning rate for gradient descent.
+    n_iter : int, optional
+        Number of iterations.
+
+    Returns
+    -------
+    weights : np.ndarray
+        Learned weights.
+    bias : float
+        Learned intercept.
+    """
+    n_samples, n_features = X.shape
+    weights = np.zeros(n_features, dtype=float)
+    bias = 0.0
+    for _ in range(n_iter):
+        z = X.dot(weights) + bias
+        p = 1.0 / (1.0 + np.exp(-z))  # sigmoid
+        # Gradient of the log-likelihood
+        grad_w = (X.T.dot(p - y)) / n_samples
+        grad_b = np.sum(p - y) / n_samples
+        weights -= lr * grad_w
+        bias -= lr * grad_b
+    return weights, bias
+
+def _predict_logistic_numpy(X: np.ndarray, weights: np.ndarray, bias: float) -> np.ndarray:
+    """
+    Compute probabilities for samples given weights and bias.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Standardized feature matrix.
+    weights : np.ndarray
+        Trained weight vector.
+    bias : float
+        Trained intercept.
+
+    Returns
+    -------
+    probs : np.ndarray
+        Predicted probabilities for the positive class.
+    """
+    z = X.dot(weights) + bias
+    return 1.0 / (1.0 + np.exp(-z))
 
 def _pick_series(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     if isinstance(df.columns, pd.MultiIndex):
@@ -786,189 +868,186 @@ def analyze_ticker(
         backtest_count = 0
 
     # ---------------------------------------------------------------------
-    # Meta‑signal via logistic regression (ML Lite)
+    # Meta‑signal via logistic regression (pure NumPy)
     #
-    # Using historical data for this ticker, we assemble a feature matrix
-    # capturing technical state (trend, momentum, volatility, volume, bands)
-    # and select fundamental metrics that are constant across the series.
-    # A binary label indicates whether returns over a fixed holding period
-    # were positive (>0).  We then fit a logistic regression model on
-    # recent observations and compute the probability for the latest row.
-    # If scikit‑learn is unavailable or the data is insufficient, this
-    # section quietly skips.  The resulting probability (ml_prob) is
-    # incorporated into the overall score and exposed in the metrics.
+    # Assemble a feature matrix capturing trend, momentum, volatility, volume,
+    # Bollinger band attributes and a handful of fundamental constants.  Use a
+    # fixed holding period to label whether future returns were positive.
+    # Train a simple logistic regression using gradient descent and compute
+    # the probability for the latest row.  Adjust the overall score based
+    # on this probability and store it for display.  If insufficient data
+    # exists or the classes are imbalanced, the ML probability will remain
+    # None and this step will not affect the score.
     ml_prob = None
-    if LogisticRegression is not None and StandardScaler is not None:
-        try:
-            hold_days_ml = 10
-            feature_list: List[List[float]] = []
-            label_list: List[int] = []
-            # Precompute rolling slopes for SMA50 to avoid recomputing inside the loop
-            sma50_series = df["SMA50"].reset_index(drop=True)
-            # Precompute Bollinger mid/upper/lower arrays for speed
-            bb_mid_arr = bb_mid.reset_index(drop=True)
-            bb_upper_arr = bb_upper.reset_index(drop=True)
-            bb_lower_arr = bb_lower.reset_index(drop=True)
-            # Determine range of indices to sample for ML; skip initial 20 bars to allow SMA/Bollinger periods to populate
-            for idx in range(20, len(df) - hold_days_ml):
-                row = df.iloc[idx]
-                # Compute features for this row
-                # Trend ratios
-                sma50_val = row.get("SMA50", np.nan)
-                sma200_val = row.get("SMA200", np.nan)
-                close_val = row.get("Close", np.nan)
-                sma_ratio = (close_val / sma50_val - 1.0) if (not np.isnan(close_val) and not np.isnan(sma50_val) and sma50_val != 0) else 0.0
-                sma200_ratio = (close_val / sma200_val - 1.0) if (not np.isnan(close_val) and not np.isnan(sma200_val) and sma200_val != 0) else 0.0
-                sma_cross = (sma50_val / sma200_val - 1.0) if (not np.isnan(sma50_val) and not np.isnan(sma200_val) and sma200_val != 0) else 0.0
-                # 5‑period slope of SMA50
-                if idx >= 5 and not np.isnan(sma50_series.iloc[idx]) and not np.isnan(sma50_series.iloc[idx - 5]):
-                    slope50_feature = float(sma50_series.iloc[idx] - sma50_series.iloc[idx - 5])
-                else:
-                    slope50_feature = 0.0
-                # Momentum
-                macd_val = row.get("MACD", np.nan)
-                macd_sig = row.get("MACD_signal", np.nan)
-                macd_hist_val = row.get("MACD_hist", np.nan)
-                macd_diff = (macd_val - macd_sig) if (not np.isnan(macd_val) and not np.isnan(macd_sig)) else 0.0
-                macd_hist_feature = float(macd_hist_val) if not np.isnan(macd_hist_val) else 0.0
-                # Oscillator
-                rsi_feature = float(row.get("RSI14", 50.0) if not np.isnan(row.get("RSI14", np.nan)) else 50.0)
-                # Volatility / Volume / Extension
-                atr_feature = float(row.get("ATR_pct", 0.0) if not np.isnan(row.get("ATR_pct", np.nan)) else 0.0)
-                vol_feature = float(row.get("VolSurge", 1.0) if not np.isnan(row.get("VolSurge", np.nan)) else 1.0)
-                ext_feature = sma_ratio  # reuse sma_ratio (close relative to SMA50)
-                # Bollinger features
-                # Guard division by zero and NaN; fallback to neutral values
-                if (not np.isnan(bb_upper_arr.iloc[idx]) and not np.isnan(bb_lower_arr.iloc[idx]) and
-                    (bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx]) != 0):
-                    bb_pos_feature = (close_val - bb_lower_arr.iloc[idx]) / (bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx])
-                    bb_pos_feature = max(0.0, min(1.0, float(bb_pos_feature)))
-                else:
-                    bb_pos_feature = 0.5
-                if (not np.isnan(bb_mid_arr.iloc[idx]) and bb_mid_arr.iloc[idx] != 0):
-                    bb_width_feature = float((bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx]) / bb_mid_arr.iloc[idx])
-                else:
-                    bb_width_feature = 1.0
-                # Fundamental features (constants across all rows).  Missing values default to 0.
-                fm_profit = float(profit_margin) if profit_margin not in [None, np.nan] else 0.0
-                fm_pe = float(pe_ratio) if pe_ratio not in [None, np.nan] else 0.0
-                fm_roe = float(roe) if roe not in [None, np.nan] else 0.0
-                fm_gross = float(gross_margin) if isinstance(gross_margin, (int, float)) else 0.0
-                fm_oper = float(op_margin) if isinstance(op_margin, (int, float)) else 0.0
-                fm_ebitda = float(ebitda_margin) if isinstance(ebitda_margin, (int, float)) else 0.0
-                fm_fcf = float(fcf_margin) if fcf_margin not in [None, np.nan] else 0.0
-                fm_revgr = float(revenue_growth) if isinstance(revenue_growth, (int, float)) else 0.0
-                fm_leverage = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
-                f_vec = [
-                    sma_ratio,
-                    sma200_ratio,
-                    sma_cross,
-                    slope50_feature,
-                    macd_diff,
-                    macd_hist_feature,
-                    rsi_feature,
-                    atr_feature,
-                    vol_feature,
-                    ext_feature,
-                    bb_pos_feature,
-                    bb_width_feature,
-                    fm_profit,
-                    fm_pe,
-                    fm_roe,
-                    fm_gross,
-                    fm_oper,
-                    fm_ebitda,
-                    fm_fcf,
-                    fm_revgr,
-                    fm_leverage,
-                ]
-                # Skip if any value is NaN or infinite
-                if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in f_vec]):
-                    continue
-                feature_list.append(f_vec)
-                # Label: positive return after hold_days_ml
-                fut_close = df["Close"].iloc[idx + hold_days_ml]
-                curr_close = close_val
-                if not np.isnan(fut_close) and not np.isnan(curr_close) and curr_close != 0:
-                    ret = (float(fut_close) / float(curr_close)) - 1.0
-                    label_list.append(1 if ret > 0 else 0)
-            # End loop
-            # Only proceed if we have a mix of positive and negative cases
-            if feature_list and len(set(label_list)) >= 2:
-                X = np.array(feature_list)
-                y = np.array(label_list)
-                scaler_ml = StandardScaler()
-                X_scaled = scaler_ml.fit_transform(X)
-                model_ml = LogisticRegression(max_iter=200)
-                model_ml.fit(X_scaled, y)
-                # Compute features for the most recent day
-                last_idx = len(df) - 1
-                row_last = df.iloc[last_idx]
-                close_last = row_last.get("Close", np.nan)
-                sma50_last = row_last.get("SMA50", np.nan)
-                sma200_last = row_last.get("SMA200", np.nan)
-                sma_ratio_last = (close_last / sma50_last - 1.0) if (not np.isnan(close_last) and not np.isnan(sma50_last) and sma50_last != 0) else 0.0
-                sma200_ratio_last = (close_last / sma200_last - 1.0) if (not np.isnan(close_last) and not np.isnan(sma200_last) and sma200_last != 0) else 0.0
-                sma_cross_last = (sma50_last / sma200_last - 1.0) if (not np.isnan(sma50_last) and not np.isnan(sma200_last) and sma200_last != 0) else 0.0
-                if last_idx >= 5 and not np.isnan(sma50_series.iloc[last_idx]) and not np.isnan(sma50_series.iloc[last_idx - 5]):
-                    slope50_last = float(sma50_series.iloc[last_idx] - sma50_series.iloc[last_idx - 5])
-                else:
-                    slope50_last = 0.0
-                macd_val_last = row_last.get("MACD", np.nan)
-                macd_sig_last = row_last.get("MACD_signal", np.nan)
-                macd_hist_last = row_last.get("MACD_hist", np.nan)
-                macd_diff_last = (macd_val_last - macd_sig_last) if (not np.isnan(macd_val_last) and not np.isnan(macd_sig_last)) else 0.0
-                macd_hist_last_val = float(macd_hist_last) if not np.isnan(macd_hist_last) else 0.0
-                rsi_last = float(row_last.get("RSI14", 50.0) if not np.isnan(row_last.get("RSI14", np.nan)) else 50.0)
-                atr_last = float(row_last.get("ATR_pct", 0.0) if not np.isnan(row_last.get("ATR_pct", np.nan)) else 0.0)
-                vol_last = float(row_last.get("VolSurge", 1.0) if not np.isnan(row_last.get("VolSurge", np.nan)) else 1.0)
-                ext_last = sma_ratio_last
-                # Bollinger features for last row
-                if (not np.isnan(bb_upper_arr.iloc[last_idx]) and not np.isnan(bb_lower_arr.iloc[last_idx]) and
-                    (bb_upper_arr.iloc[last_idx] - bb_lower_arr.iloc[last_idx]) != 0):
-                    bb_pos_last = (close_last - bb_lower_arr.iloc[last_idx]) / (bb_upper_arr.iloc[last_idx] - bb_lower_arr.iloc[last_idx])
-                    bb_pos_last = max(0.0, min(1.0, float(bb_pos_last)))
-                else:
-                    bb_pos_last = 0.5
-                if (not np.isnan(bb_mid_arr.iloc[last_idx]) and bb_mid_arr.iloc[last_idx] != 0):
-                    bb_width_last = float((bb_upper_arr.iloc[last_idx] - bb_lower_arr.iloc[last_idx]) / bb_mid_arr.iloc[last_idx])
-                else:
-                    bb_width_last = 1.0
-                # Use same fundamental metrics constants
-                f_last = [
-                    sma_ratio_last,
-                    sma200_ratio_last,
-                    sma_cross_last,
-                    slope50_last,
-                    macd_diff_last,
-                    macd_hist_last_val,
-                    rsi_last,
-                    atr_last,
-                    vol_last,
-                    ext_last,
-                    bb_pos_last,
-                    bb_width_last,
-                    fm_profit,
-                    fm_pe,
-                    fm_roe,
-                    fm_gross,
-                    fm_oper,
-                    fm_ebitda,
-                    fm_fcf,
-                    fm_revgr,
-                    fm_leverage,
-                ]
-                # Scale and predict probability
-                f_last_scaled = scaler_ml.transform([f_last])
-                prob = model_ml.predict_proba(f_last_scaled)[0][1]
-                ml_prob = float(prob)
-        except Exception:
-            ml_prob = None
+    try:
+        hold_ml = 10
+        feat_matrix: List[List[float]] = []
+        labels_ml: List[int] = []
+        # Precompute arrays for SMA and Bollinger bands to speed access
+        sma50_series = df["SMA50"].reset_index(drop=True)
+        sma200_series = df["SMA200"].reset_index(drop=True)
+        bb_mid_arr = bb_mid.reset_index(drop=True)
+        bb_upper_arr = bb_upper.reset_index(drop=True)
+        bb_lower_arr = bb_lower.reset_index(drop=True)
+        close_series = df["Close"].reset_index(drop=True)
+        volsurge_series = df["VolSurge"].reset_index(drop=True)
+        atrpct_series = df["ATR_pct"].reset_index(drop=True)
+        rsi_series = df["RSI14"].reset_index(drop=True)
+        macd_series = df["MACD"].reset_index(drop=True)
+        macdsig_series = df["MACD_signal"].reset_index(drop=True)
+        machist_series = df["MACD_hist"].reset_index(drop=True)
+        for idx in range(20, len(df) - hold_ml):
+            # base values
+            close_val = close_series.iloc[idx]
+            sma50_val = sma50_series.iloc[idx]
+            sma200_val = sma200_series.iloc[idx]
+            # Trend ratios
+            sma_ratio = (close_val / sma50_val - 1.0) if (not np.isnan(close_val) and not np.isnan(sma50_val) and sma50_val != 0) else 0.0
+            sma200_ratio = (close_val / sma200_val - 1.0) if (not np.isnan(close_val) and not np.isnan(sma200_val) and sma200_val != 0) else 0.0
+            sma_cross = (sma50_val / sma200_val - 1.0) if (not np.isnan(sma50_val) and not np.isnan(sma200_val) and sma200_val != 0) else 0.0
+            # Slope of SMA50 over 5 periods
+            if idx >= 5 and not np.isnan(sma50_series.iloc[idx]) and not np.isnan(sma50_series.iloc[idx - 5]):
+                slope50_f = float(sma50_series.iloc[idx] - sma50_series.iloc[idx - 5])
+            else:
+                slope50_f = 0.0
+            # Momentum
+            macd_val = macd_series.iloc[idx]
+            macd_sig = macdsig_series.iloc[idx]
+            macd_hist_val = machist_series.iloc[idx]
+            macd_diff = (macd_val - macd_sig) if (not np.isnan(macd_val) and not np.isnan(macd_sig)) else 0.0
+            macd_hist_f = float(macd_hist_val) if not np.isnan(macd_hist_val) else 0.0
+            # RSI
+            rsi_f = float(rsi_series.iloc[idx]) if not np.isnan(rsi_series.iloc[idx]) else 50.0
+            # Volatility / volume / extension
+            atr_f = float(atrpct_series.iloc[idx]) if not np.isnan(atrpct_series.iloc[idx]) else 0.0
+            vol_f = float(volsurge_series.iloc[idx]) if not np.isnan(volsurge_series.iloc[idx]) else 1.0
+            ext_f = sma_ratio
+            # Bollinger features
+            if (not np.isnan(bb_upper_arr.iloc[idx]) and not np.isnan(bb_lower_arr.iloc[idx]) and (bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx]) != 0):
+                bb_pos_f = (close_val - bb_lower_arr.iloc[idx]) / (bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx])
+                bb_pos_f = max(0.0, min(1.0, float(bb_pos_f)))
+            else:
+                bb_pos_f = 0.5
+            if (not np.isnan(bb_mid_arr.iloc[idx]) and bb_mid_arr.iloc[idx] != 0):
+                bb_width_f = float((bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx]) / bb_mid_arr.iloc[idx])
+            else:
+                bb_width_f = 1.0
+            # Fundamental constants (use defaults for missing values)
+            fm_profit = float(profit_margin) if profit_margin not in [None, np.nan] else 0.0
+            fm_pe = float(pe_ratio) if pe_ratio not in [None, np.nan] else 0.0
+            fm_roe = float(roe) if roe not in [None, np.nan] else 0.0
+            fm_gross = float(gross_margin) if isinstance(gross_margin, (int, float)) else 0.0
+            fm_oper_f = float(op_margin) if isinstance(op_margin, (int, float)) else 0.0
+            fm_ebitda_f = float(ebitda_margin) if isinstance(ebitda_margin, (int, float)) else 0.0
+            fm_fcf_f = float(fcf_margin) if fcf_margin not in [None, np.nan] else 0.0
+            fm_revgr_f = float(revenue_growth) if isinstance(revenue_growth, (int, float)) else 0.0
+            fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
+            feature_vec = [
+                sma_ratio,
+                sma200_ratio,
+                sma_cross,
+                slope50_f,
+                macd_diff,
+                macd_hist_f,
+                rsi_f,
+                atr_f,
+                vol_f,
+                ext_f,
+                bb_pos_f,
+                bb_width_f,
+                fm_profit,
+                fm_pe,
+                fm_roe,
+                fm_gross,
+                fm_oper_f,
+                fm_ebitda_f,
+                fm_fcf_f,
+                fm_revgr_f,
+                fm_leverage_f,
+            ]
+            # Skip vector if any value is NaN or infinite
+            if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
+                continue
+            feat_matrix.append(feature_vec)
+            # Label: positive return after hold_ml
+            next_close = close_series.iloc[idx + hold_ml]
+            curr_close = close_val
+            if not np.isnan(next_close) and not np.isnan(curr_close) and curr_close != 0:
+                ret_ml = (float(next_close) / float(curr_close)) - 1.0
+                labels_ml.append(1 if ret_ml > 0 else 0)
+        # Ensure we have enough samples and both classes present
+        if feat_matrix and len(set(labels_ml)) >= 2:
+            X_raw = np.array(feat_matrix, dtype=float)
+            y_raw = np.array(labels_ml, dtype=float)
+            # Standardize features
+            X_std, mean_vec, std_vec = _standardize_features(X_raw)
+            # Train logistic regression
+            weights_ml, bias_ml = _train_logistic_numpy(X_std, y_raw, lr=0.05, n_iter=200)
+            # Compute features for current row
+            idx_last = len(df) - 1
+            close_last = close_series.iloc[idx_last]
+            sma50_last = sma50_series.iloc[idx_last]
+            sma200_last = sma200_series.iloc[idx_last]
+            sma_ratio_last = (close_last / sma50_last - 1.0) if (not np.isnan(close_last) and not np.isnan(sma50_last) and sma50_last != 0) else 0.0
+            sma200_ratio_last = (close_last / sma200_last - 1.0) if (not np.isnan(close_last) and not np.isnan(sma200_last) and sma200_last != 0) else 0.0
+            sma_cross_last = (sma50_last / sma200_last - 1.0) if (not np.isnan(sma50_last) and not np.isnan(sma200_last) and sma200_last != 0) else 0.0
+            if idx_last >= 5 and not np.isnan(sma50_series.iloc[idx_last]) and not np.isnan(sma50_series.iloc[idx_last - 5]):
+                slope50_last = float(sma50_series.iloc[idx_last] - sma50_series.iloc[idx_last - 5])
+            else:
+                slope50_last = 0.0
+            macd_last = macd_series.iloc[idx_last]
+            macdsig_last = macdsig_series.iloc[idx_last]
+            machist_last = machist_series.iloc[idx_last]
+            macd_diff_last = (macd_last - macdsig_last) if (not np.isnan(macd_last) and not np.isnan(macdsig_last)) else 0.0
+            macd_hist_last_f = float(machist_last) if not np.isnan(machist_last) else 0.0
+            rsi_last_f = float(rsi_series.iloc[idx_last]) if not np.isnan(rsi_series.iloc[idx_last]) else 50.0
+            atr_last_f = float(atrpct_series.iloc[idx_last]) if not np.isnan(atrpct_series.iloc[idx_last]) else 0.0
+            vol_last_f = float(volsurge_series.iloc[idx_last]) if not np.isnan(volsurge_series.iloc[idx_last]) else 1.0
+            ext_last_f = sma_ratio_last
+            # Bollinger features for last row
+            if (not np.isnan(bb_upper_arr.iloc[idx_last]) and not np.isnan(bb_lower_arr.iloc[idx_last]) and (bb_upper_arr.iloc[idx_last] - bb_lower_arr.iloc[idx_last]) != 0):
+                bb_pos_last = (close_last - bb_lower_arr.iloc[idx_last]) / (bb_upper_arr.iloc[idx_last] - bb_lower_arr.iloc[idx_last])
+                bb_pos_last = max(0.0, min(1.0, float(bb_pos_last)))
+            else:
+                bb_pos_last = 0.5
+            if (not np.isnan(bb_mid_arr.iloc[idx_last]) and bb_mid_arr.iloc[idx_last] != 0):
+                bb_width_last = float((bb_upper_arr.iloc[idx_last] - bb_lower_arr.iloc[idx_last]) / bb_mid_arr.iloc[idx_last])
+            else:
+                bb_width_last = 1.0
+            f_last = [
+                sma_ratio_last,
+                sma200_ratio_last,
+                sma_cross_last,
+                slope50_last,
+                macd_diff_last,
+                macd_hist_last_f,
+                rsi_last_f,
+                atr_last_f,
+                vol_last_f,
+                ext_last_f,
+                bb_pos_last,
+                bb_width_last,
+                fm_profit,
+                fm_pe,
+                fm_roe,
+                fm_gross,
+                fm_oper_f,
+                fm_ebitda_f,
+                fm_fcf_f,
+                fm_revgr_f,
+                fm_leverage_f,
+            ]
+            # Standardize last feature vector using training means/stds
+            X_last_std = (np.array(f_last) - mean_vec) / std_vec
+            # Predict probability
+            ml_prob_val = _predict_logistic_numpy(X_last_std.reshape(1, -1), weights_ml, bias_ml)
+            ml_prob = float(ml_prob_val[0])
+    except Exception:
+        ml_prob = None
 
-    # Adjust score based on ML probability and add to explanations
+    # Adjust score and reasons based on ML probability
     if ml_prob is not None:
         ml_pct = ml_prob * 100.0
-        # Multi‑tier scaling: stronger adjustment for higher probabilities
         if ml_prob >= 0.8:
             score += 1.0
             reasons.append(f"ML prob {ml_pct:.0f}% (very strong)")
@@ -1082,7 +1161,7 @@ def analyze_ticker(
             "flags": {"macd_ok": bool(macd_ok), "rel_ok": bool(rel_ok),
                       "near_high": bool(near_high), "breakout_vol_ok": bool(breakout_vol_ok),
                       "spy_regime_ok": bool(spy_regime_ok)},
-        # ML meta‑signal probability (0‑1) as percentage.  None if unavailable.
+        # ML meta‑signal probability expressed as a percentage.  None if ML model not run.
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
         },
         "explanations": reasons,
@@ -1541,7 +1620,7 @@ for r in results:
         if m.get("net_debt_ebitda") is not None:
             st.text(f"Net debt/EBITDA: {m.get('net_debt_ebitda')}")
 
-        # Display ML probability if available
+        # Display ML probability when available
         if m.get("ml_prob_pct") is not None:
             st.text(f"ML prob: {m.get('ml_prob_pct'):.1f}%")
 
