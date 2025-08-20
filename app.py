@@ -1,8 +1,13 @@
-# app.py  — Streamlit Watchlist Swing-Assistant + Supabase auth (username+password)
-# -------------------------------------------------------------------------------
-# Запазен UI/логика; поправки:
+# app.py — Streamlit Watchlist Swing-Assistant + Supabase auth (username+password)
+# --------------------------------------------------------------------------------
+# Поправки:
 # - st.experimental_rerun -> st.rerun (Streamlit 1.30+)
-# - Login/Register през st.form + form_submit_button (фиксира „натисни 2 пъти“)
+# - Login/Register през st.form + form_submit_button (фиксира “двойно кликане”)
+# - Устойчиво съхранение в Supabase:
+#     * watchlists.user_id = PRIMARY KEY (изискано от миграцията ти)
+#     * upsert(..., on_conflict="user_id") за да няма дубликати
+#     * load_watchlist() взема последния запис и създава ред при липса
+#     * парсва data и ако е стринг → json.loads
 
 from __future__ import annotations
 import json, os, time
@@ -30,7 +35,7 @@ try:
 except Exception:
     HAS_AUTOR = False
 
-# --- Supabase (free, no disk needed) ---
+# --- Supabase client ---
 from slugify import slugify
 from supabase import create_client, Client
 
@@ -91,14 +96,12 @@ def _pick_series(df: pd.DataFrame, keys: List[str]) -> pd.Series:
         for key in keys:
             try:
                 if key in df.columns.get_level_values(0):
-                    s = df[key]
-                    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
+                    s = df[key]; s = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
                     return pd.to_numeric(s, errors="coerce")
             except Exception: pass
             try:
                 if key in df.columns.get_level_values(1):
-                    s = df.xs(key, level=1, axis=1)
-                    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
+                    s = df.xs(key, level=1, axis=1); s = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
                     return pd.to_numeric(s, errors="coerce")
             except Exception: pass
         flat = df.copy()
@@ -381,7 +384,7 @@ def _logout():
         pass
     for k in ["auth_ok", "auth_user", "auth_uid", "login_fail_count", "login_lock_until"]:
         st.session_state.pop(k, None)
-    st.rerun()  # <- fixed
+    st.rerun()  # fixed
 
 def _ensure_profile(uid: str, username: str):
     try:
@@ -391,7 +394,7 @@ def _ensure_profile(uid: str, username: str):
 
 def _auth_gate() -> bool:
     if not sb:
-        st.error("Missing Supabase config. Add SUPABASE_URL and SUPABASE_ANON_KEY in Render → Environment.")
+        st.error("Missing Supabase config. Set SUPABASE_URL and SUPABASE_ANON_KEY in environment.")
         st.stop()
 
     now = time.time()
@@ -418,7 +421,7 @@ def _auth_gate() -> bool:
 
     tabs = st.tabs(["Sign in", "Create profile"])
 
-    # -------- LOGIN FORM (prevents double-click) --------
+    # LOGIN FORM
     with tabs[0]:
         with st.form("login_form"):
             u = st.text_input("Username", key="login_user")
@@ -435,7 +438,7 @@ def _auth_gate() -> bool:
                     st.session_state.pop("login_fail_count", None)
                     st.session_state.pop("login_lock_until", None)
                     _ensure_profile(sess.user.id, (u or "").strip())
-                    st.rerun()  # <- fixed
+                    st.rerun()
                 else:
                     raise Exception("no session")
             except Exception:
@@ -445,7 +448,7 @@ def _auth_gate() -> bool:
                     st.session_state["login_lock_until"] = time.time() + 10 * 60
                 st.error("Invalid username or password.")
 
-    # -------- REGISTER FORM --------
+    # REGISTER FORM
     with tabs[1]:
         with st.form("register_form"):
             nu = st.text_input("Username (min 3 chars)", key="reg_user")
@@ -471,7 +474,7 @@ def _auth_gate() -> bool:
                 st.session_state["auth_user"] = uname
                 _ensure_profile(sess.user.id, uname)
                 st.success("Profile created.")
-                st.rerun()  # <- fixed
+                st.rerun()
             except Exception:
                 st.error("Username may be taken. Try another.")
                 st.stop()
@@ -482,33 +485,79 @@ def _auth_gate() -> bool:
 def _session_uid() -> str | None:
     return st.session_state.get("auth_uid")
 
+def _default_state() -> Dict[str, Any]:
+    return {
+        "tickers": DEFAULT_TICKERS,
+        "profile": DEFAULT_PROFILE,
+        "auto_refresh_minutes": 15,
+        "acct_size": 10000.0,
+        "risk_pct": 1.0,
+        "relax_guards": False,
+        "market_guard": True,
+        "ts_enabled": False,
+        "ts_mult": 1.5,
+    }
+
 def load_watchlist() -> Dict[str, Any]:
-    default = {"tickers": DEFAULT_TICKERS, "profile": DEFAULT_PROFILE,
-               "auto_refresh_minutes": 15, "acct_size": 10000.0, "risk_pct": 1.0}
+    default = _default_state()
     uid = _session_uid()
-    if not uid: return default
+    if not uid:
+        return default
+
     skey = f"watchlist_state__{uid}"
     if skey in st.session_state:
         return st.session_state[skey]
+
     try:
-        res = sb.table("watchlists").select("data").eq("user_id", uid).single().execute()
-        data = (res.data or {}).get("data", None)
-        st.session_state[skey] = data if isinstance(data, dict) else default
+        q = (
+            sb.table("watchlists")
+            .select("data, updated_at")
+            .eq("user_id", uid)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = q.data or []
+        if not rows:
+            # няма ред → създай с defaults
+            sb.table("watchlists").insert({"user_id": uid, "data": default}).execute()
+            st.session_state[skey] = default
+            return default
+
+        data = rows[0].get("data", {})
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                data = default
+        if not isinstance(data, dict):
+            data = default
+
+        # запълни липсващи ключове с defaults (ако си добавил нови опции)
+        merged = {**default, **data}
+        st.session_state[skey] = merged
+        return merged
+
     except Exception:
         st.session_state[skey] = default
-    return st.session_state[skey]
+        return default
 
 def save_watchlist(state: Dict[str, Any]) -> None:
     uid = _session_uid()
-    if not uid: return
+    if not uid:
+        return
+
     skey = f"watchlist_state__{uid}"
     st.session_state[skey] = state
+
     try:
-        sb.table("watchlists").upsert({
+        payload = {
             "user_id": uid,
             "data": state,
             "updated_at": datetime.utcnow().isoformat() + "Z",
-        }).execute()
+        }
+        # Ключово: без дубликати на редове
+        sb.table("watchlists").upsert(payload, on_conflict="user_id").execute()
     except Exception:
         pass
 
@@ -588,7 +637,7 @@ if state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
 
 with st.sidebar:
     if st.button("🔄 Refresh now"):
-        st.rerun()  # <- fixed
+        st.rerun()
 
 # Main
 watch = state.get("tickers", [])
@@ -690,7 +739,6 @@ for r in results:
         if m.get("ibkr_delta_pct") is not None:
             st.text(f"IBKR Δ%: {m.get('ibkr_delta_pct')}%")
 
-    # --------- FIXED BLOCK (correct indentation + safe formatting) ----------
     with st.expander("📋 IBKR order (copy)"):
         side_default = 0 if r.get("signal") == "BUY" else 1
         side = st.selectbox("Side", ["BUY", "SELL"], index=side_default, key=f"side_{t}")
@@ -700,11 +748,9 @@ for r in results:
         sl_mult = m.get("sl_mult")
         tp_mult = m.get("tp_mult")
 
-        # Outer IF — ELSE must align with this IF
         if entry is not None and atr_abs is not None and sl_mult is not None and tp_mult is not None:
             ord_tp = round(entry + tp_mult * atr_abs, 2) if side == "BUY" else round(entry - tp_mult * atr_abs, 2)
 
-            # Trailing stop variant
             if state.get("ts_enabled", False):
                 trail_amt = round(state.get("ts_mult", 1.5) * atr_abs, 2)
                 risk_per_share = trail_amt
@@ -723,7 +769,6 @@ Risk/share (≈trail): ${risk_per_share:.2f}
 Risk amount ({state.get('risk_pct',1.0):.2f}% of ${state.get('acct_size',10000.0):.2f}): ${state.get('acct_size',10000.0) * state.get('risk_pct',1.0) / 100.0:.2f}
 Note: R:R is approximate with trailing stops.
 """
-            # Fixed SL/TP variant
             else:
                 ord_sl = round(entry - sl_mult * atr_abs, 2) if side == "BUY" else round(entry + sl_mult * atr_abs, 2)
                 risk_per_share = abs(entry - ord_sl)
@@ -749,7 +794,6 @@ Approx. R:R: {rr_text}
             st.code(order_text, language="text")
         else:
             st.info("Not enough data to compute ATR-based SL/TP.")
-    # -----------------------------------------------------------------------
 
     with st.expander("🔍 BuyGuard checks"):
         flags = m.get("flags", {})
