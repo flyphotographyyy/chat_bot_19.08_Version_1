@@ -55,6 +55,30 @@ PROFILE_CONFIG = {
                    "earnings_blackout_days": 5, "rsi_upper": 70, "sl_atr_mult": 1.8, "tp_atr_mult": 3.0},
 }
 
+# Mapping of company sectors to representative SPDR sector ETFs.  These ETFs
+# serve as proxies for sector performance, enabling us to compare each
+# ticker's recent returns against its sector benchmark.  If a sector is
+# missing from this mapping, the sector-relative strength check will be
+# skipped for that ticker.
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Information Technology": "XLK",
+    "Health Care": "XLV",
+    "Financial Services": "XLF",
+    "Financials": "XLF",
+    "Consumer Cyclical": "XLY",
+    "Consumer Discretionary": "XLY",
+    "Consumer Defensive": "XLP",
+    "Consumer Staples": "XLP",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Basic Materials": "XLB",
+    "Materials": "XLB",
+    "Communication Services": "XLC",
+}
+
 # ---------------- Helpers ----------------
 def sma(series: pd.Series, w: int) -> pd.Series: return series.rolling(w).mean()
 def ema(series: pd.Series, span: int) -> pd.Series: return series.ewm(span=span, adjust=False).mean()
@@ -365,6 +389,131 @@ def analyze_ticker(
             reasons.append(f"ROE weak {roe*100:.1f}%")
     # ---------------------------------------------------------------------
 
+    # ---------------------------------------------------------------------
+    # Extended fundamental metrics
+    # In addition to simple profit margins and P/E ratios, look at gross,
+    # operating and EBITDA margins, free cash flow (FCF) margin, net debt and
+    # leverage, and revenue growth.  These metrics offer a broader view of
+    # financial health and capital structure.  Where available, apply
+    # heuristic scoring and capture the values for display.
+    try:
+        gross_margin = fundamentals.get("grossMargins")
+        op_margin = fundamentals.get("operatingMargins")
+        ebitda_margin = fundamentals.get("ebitdaMargins")
+        free_cash_flow = fundamentals.get("freeCashflow")
+        total_revenue = fundamentals.get("totalRevenue") or fundamentals.get("revenue")
+        operating_cash_flow = fundamentals.get("operatingCashflow")
+        capex = fundamentals.get("capitalExpenditures")
+        total_debt = fundamentals.get("totalDebt")
+        cash_balance = fundamentals.get("cash") or fundamentals.get("totalCash")
+        ebitda_val = fundamentals.get("ebitda")
+        revenue_growth = fundamentals.get("revenueGrowth")
+    except Exception:
+        gross_margin = op_margin = ebitda_margin = None
+        free_cash_flow = total_revenue = None
+        operating_cash_flow = capex = None
+        total_debt = cash_balance = ebitda_val = None
+        revenue_growth = None
+
+    # Compute FCF margin where FCF and revenue are available
+    fcf_margin = None
+    try:
+        if free_cash_flow is not None and total_revenue:
+            fcf_margin = float(free_cash_flow) / float(total_revenue) if float(total_revenue) != 0 else None
+    except Exception:
+        fcf_margin = None
+    # Compute net debt and leverage
+    net_debt = None
+    net_debt_ebitda = None
+    try:
+        if total_debt is not None and cash_balance is not None:
+            net_debt = float(total_debt) - float(cash_balance)
+        if net_debt is not None and ebitda_val is not None and ebitda_val != 0:
+            net_debt_ebitda = float(net_debt) / float(ebitda_val)
+    except Exception:
+        net_debt = None
+        net_debt_ebitda = None
+
+    # Heuristic scoring for gross margin
+    if isinstance(gross_margin, (int, float)):
+        gm = float(gross_margin)
+        if gm > 0.5:
+            score += 0.3
+            reasons.append(f"High gross margin {gm*100:.1f}%")
+        elif gm > 0.3:
+            score += 0.2
+            reasons.append(f"Solid gross margin {gm*100:.1f}%")
+        elif gm < 0.15:
+            score -= 0.3
+            reasons.append(f"Low gross margin {gm*100:.1f}%")
+    # Heuristic scoring for operating margin
+    if isinstance(op_margin, (int, float)):
+        om = float(op_margin)
+        if om > 0.3:
+            score += 0.3
+            reasons.append(f"High operating margin {om*100:.1f}%")
+        elif om > 0.15:
+            score += 0.2
+            reasons.append(f"Solid operating margin {om*100:.1f}%")
+        elif om < 0.05:
+            score -= 0.3
+            reasons.append(f"Low operating margin {om*100:.1f}%")
+    # EBITDA margin scoring
+    if isinstance(ebitda_margin, (int, float)):
+        em = float(ebitda_margin)
+        if em > 0.3:
+            score += 0.3
+            reasons.append(f"High EBITDA margin {em*100:.1f}%")
+        elif em > 0.15:
+            score += 0.15
+            reasons.append(f"Healthy EBITDA margin {em*100:.1f}%")
+        elif em < 0.1:
+            score -= 0.2
+            reasons.append(f"Thin EBITDA margin {em*100:.1f}%")
+    # FCF margin scoring
+    if fcf_margin is not None:
+        if fcf_margin > 0.1:
+            score += 0.3
+            reasons.append(f"Strong FCF margin {fcf_margin*100:.1f}%")
+        elif fcf_margin > 0:
+            score += 0.15
+            reasons.append(f"Positive FCF margin {fcf_margin*100:.1f}%")
+        else:
+            score -= 0.3
+            reasons.append(f"Negative FCF margin {fcf_margin*100:.1f}%")
+    # Net debt / EBITDA scoring
+    if net_debt_ebitda is not None:
+        nde = float(net_debt_ebitda)
+        if nde < 1:
+            score += 0.3
+            reasons.append(f"Low leverage (Net debt/EBITDA {nde:.2f})")
+        elif nde < 2:
+            score += 0.2
+            reasons.append(f"Moderate leverage (Net debt/EBITDA {nde:.2f})")
+        elif nde > 6:
+            score -= 0.5
+            reasons.append(f"Very high leverage (Net debt/EBITDA {nde:.2f})")
+        elif nde > 4:
+            score -= 0.3
+            reasons.append(f"High leverage (Net debt/EBITDA {nde:.2f})")
+    # Net cash bonus when cash exceeds debt
+    if net_debt is not None and net_debt < 0:
+        score += 0.3
+        reasons.append("Net cash position (more cash than debt)")
+    # Revenue growth scoring
+    if isinstance(revenue_growth, (int, float)):
+        rg = float(revenue_growth)
+        if rg > 0.15:
+            score += 0.3
+            reasons.append(f"Strong revenue growth {rg*100:.1f}%")
+        elif rg > 0.05:
+            score += 0.1
+            reasons.append(f"Moderate revenue growth {rg*100:.1f}%")
+        elif rg < 0:
+            score -= 0.2
+            reasons.append(f"Negative revenue growth {rg*100:.1f}%")
+    # ---------------------------------------------------------------------
+
     # Trend
     if latest["Close"] > latest["SMA50"]: score += 1.0; reasons.append("Price > SMA50 (trend up)")
     else: score -= 0.5; reasons.append("Price < SMA50 (trend weak)")
@@ -478,6 +627,35 @@ def analyze_ticker(
     except Exception:
         # Silently ignore SPY comparison errors (e.g., missing data)
         pass
+
+    # ---------------------------------------------------------------------
+    # Relative strength vs sector ETF (20d)
+    # Many stocks belong to a sector with its own benchmark ETF.  Compare the
+    # stock's performance over the last 20 days to that ETF.  A stock
+    # outperforming its sector indicates idiosyncratic strength, while
+    # underperformance may signal weakness relative to peers.  Use the
+    # SECTOR_ETF_MAP to translate sector names to tickers (e.g. XLK, XLV).
+    rel_sector_pp = None
+    try:
+        sector_name = fundamentals.get("sector")
+        etf = SECTOR_ETF_MAP.get(sector_name) if isinstance(sector_name, str) else None
+        if etf:
+            # Fetch sector ETF data.  We deliberately avoid caching a separate
+            # sector DataFrame at the top level, as different tickers may have
+            # different sectors.  However, the fetch_history call is cached.
+            raw_sector = fetch_history(etf)
+            sector_df = _extract_ohlcv_1d(raw_sector) if raw_sector is not None and not raw_sector.empty else None
+            if sector_df is not None and not sector_df.empty and len(df) > 21 and len(sector_df) > 21:
+                r_s_t = df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1
+                r_s_e = sector_df["Close"].iloc[-1] / sector_df["Close"].iloc[-21] - 1
+                rel_sector_pp = (r_s_t - r_s_e) * 100
+                if rel_sector_pp > 0:
+                    score += 0.25
+                    reasons.append(f"Outperforming sector ETF by {rel_sector_pp:.1f}pp (20d)")
+                else:
+                    reasons.append(f"Underperforming sector ETF by {abs(rel_sector_pp):.1f}pp (20d)")
+    except Exception:
+        rel_sector_pp = None
 
     # Earnings blackout
     if days_to_earn is not None and days_to_earn <= cfg["earnings_blackout_days"]:
@@ -674,6 +852,16 @@ def analyze_ticker(
             "backtest_win_rate_pct": round(backtest_win * 100, 1) if backtest_win is not None else None,
             "backtest_avg_return_pct": round(backtest_avg * 100, 2) if backtest_avg is not None else None,
             "backtest_signals": backtest_count,
+            # Extended fundamental metrics
+            "gross_margin_pct": round(float(gross_margin) * 100, 2) if isinstance(gross_margin, (int, float)) else None,
+            "operating_margin_pct": round(float(op_margin) * 100, 2) if isinstance(op_margin, (int, float)) else None,
+            "ebitda_margin_pct": round(float(ebitda_margin) * 100, 2) if isinstance(ebitda_margin, (int, float)) else None,
+            "fcf_margin_pct": round(float(fcf_margin) * 100, 2) if fcf_margin is not None else None,
+            "net_debt": round(float(net_debt), 2) if net_debt is not None else None,
+            "net_debt_ebitda": round(float(net_debt_ebitda), 2) if net_debt_ebitda is not None else None,
+            "revenue_growth_pct": round(float(revenue_growth) * 100, 2) if isinstance(revenue_growth, (int, float)) else None,
+            # Sector-relative strength
+            "relSector20d_pp": round(float(rel_sector_pp), 2) if rel_sector_pp is not None else None,
             "sl": sl_level, "tp": tp_level,
             "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
@@ -997,6 +1185,13 @@ for r in results:
         "BT Win %": m.get("backtest_win_rate_pct"),
         "BT Avg %": m.get("backtest_avg_return_pct"),
         "BT Count": m.get("backtest_signals"),
+        "SecRel(pp)": m.get("relSector20d_pp"),
+        "Gross %": m.get("gross_margin_pct"),
+        "Oper %": m.get("operating_margin_pct"),
+        "EBITDA %": m.get("ebitda_margin_pct"),
+        "FCF %": m.get("fcf_margin_pct"),
+        "RevGr %": m.get("revenue_growth_pct"),
+        "Leverage (ND/EBITDA)": m.get("net_debt_ebitda"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
         "SL": m.get("sl"),
         "TP": m.get("tp"),
@@ -1007,9 +1202,47 @@ for r in results:
 summary_df = pd.DataFrame(rows)
 numeric_scores = [r.get("score", 0) for r in results if not r.get("error")]
 watchlist_score = round(float(np.nanmean(numeric_scores)) if numeric_scores else 0.0, 2)
+    
+# Diversification: compute average absolute correlation across watchlist tickers.  A high
+# correlation implies poor diversification.  We apply a penalty to the watchlist
+# score when mean absolute correlation exceeds 0.6.  The penalty scales with
+# the amount by which the correlation surpasses this threshold.
+mean_abs_corr = None
+corr_penalty = 0.0
+try:
+    # Gather daily returns for each non-error ticker
+    ret_dict: Dict[str, pd.Series] = {}
+    for r in results:
+        if not r.get("error") and r.get("df") is not None:
+            try:
+                series = r["df"]["Close"].pct_change().dropna()
+                if not series.empty:
+                    ret_dict[r["ticker"]] = series
+            except Exception:
+                continue
+    if len(ret_dict) > 1:
+        returns_df = pd.DataFrame(ret_dict).dropna()
+        if returns_df.shape[1] > 1:
+            corr_matrix = returns_df.corr()
+            # compute mean absolute off-diagonal correlation
+            mask = ~np.eye(len(corr_matrix), dtype=bool)
+            mean_abs_corr = float(corr_matrix.where(mask).abs().stack().mean())
+            # apply penalty if correlation > 0.6
+            if mean_abs_corr > 0.6:
+                corr_penalty = max(0.0, mean_abs_corr - 0.6) * 2
+                watchlist_score = max(0.0, round(watchlist_score - corr_penalty, 2))
+except Exception:
+    mean_abs_corr = None
+    corr_penalty = 0.0
 
 st.markdown(f"### 🧮 Watchlist Score: **{watchlist_score}**")
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+# Show diversification metric and any penalty applied
+if mean_abs_corr is not None:
+    st.caption(f"Mean absolute correlation across watchlist: {mean_abs_corr:.2f}")
+    if corr_penalty > 0:
+        st.caption(f"Diversification penalty applied: -{corr_penalty:.2f} to watchlist score")
 
 # Downloads
 col_dl1, col_dl2 = st.columns(2)
@@ -1074,6 +1307,22 @@ for r in results:
             st.text(f"BT avg return: {m.get('backtest_avg_return_pct')}%")
         if m.get("backtest_signals") is not None and int(m.get("backtest_signals")) > 0:
             st.text(f"BT signals: {m.get('backtest_signals')}")
+
+        # Additional fundamental and sector metrics
+        if m.get("relSector20d_pp") is not None:
+            st.text(f"RelStr 20d vs sector (pp): {m.get('relSector20d_pp')}")
+        if m.get("gross_margin_pct") is not None:
+            st.text(f"Gross margin: {m.get('gross_margin_pct')}%")
+        if m.get("operating_margin_pct") is not None:
+            st.text(f"Operating margin: {m.get('operating_margin_pct')}%")
+        if m.get("ebitda_margin_pct") is not None:
+            st.text(f"EBITDA margin: {m.get('ebitda_margin_pct')}%")
+        if m.get("fcf_margin_pct") is not None:
+            st.text(f"FCF margin: {m.get('fcf_margin_pct')}%")
+        if m.get("revenue_growth_pct") is not None:
+            st.text(f"Revenue growth: {m.get('revenue_growth_pct')}%")
+        if m.get("net_debt_ebitda") is not None:
+            st.text(f"Net debt/EBITDA: {m.get('net_debt_ebitda')}")
 
     # --------- FIXED BLOCK (correct indentation + safe formatting) ----------
     with st.expander("📋 IBKR order (copy)"):
