@@ -237,27 +237,8 @@ def analyze_ticker(
 
     # Bollinger Bands (20‑period moving average ± 2 standard deviations).
     # These are used later to gauge overbought/oversold conditions. We
-    # calculate them once here to avoid recalculating on each evaluation.
-    window_bb = 20
-    bb_mid = df["Close"].rolling(window_bb).mean()
-    bb_std = df["Close"].rolling(window_bb).std(ddof=0)
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-
-    # Bollinger Bands (20‑period moving average ± 2 standard deviations).
-    # These are used later to gauge overbought/oversold conditions. We
-    # calculate them once here to avoid recalculating on each evaluation.
-    window_bb = 20
-    bb_mid = df["Close"].rolling(window_bb).mean()
-    bb_std = df["Close"].rolling(window_bb).std(ddof=0)
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-
-    # Bollinger Bands (20‑period moving average ± 2 standard deviations).  We
-    # compute these here once per ticker to avoid repeated rolling window
-    # operations later in the function.  They help identify whether price is
-    # stretched relative to recent volatility.  Note: ddof=0 for a population
-    # standard deviation.
+    # calculate them once here to avoid recalculating on each evaluation. Note:
+    # ddof=0 for population standard deviation.
     window_bb = 20
     bb_mid = df["Close"].rolling(window_bb).mean()
     bb_std = df["Close"].rolling(window_bb).std(ddof=0)
@@ -298,6 +279,28 @@ def analyze_ticker(
         if slope50 > 0: score += 0.5; reasons.append("SMA50 rising")
         else: score -= 0.5; reasons.append("SMA50 falling")
 
+    # Multi‑timeframe confirmation: compare weekly SMA10 vs SMA40
+    # This helps gauge the broader trend and reduces false positives.
+    try:
+        # Fetch approximately 3 years of weekly data (to have at least 40 weeks)
+        raw_weekly = yf.download(ticker, period="3y", interval="1wk", progress=False)
+        if raw_weekly is not None and not raw_weekly.empty:
+            # Use _pick_series to gracefully handle MultiIndex columns
+            weekly_close = _pick_series(raw_weekly, ["Adj Close", "Close"]).dropna()
+            if len(weekly_close) >= 40:
+                sma10_w = weekly_close.rolling(10).mean()
+                sma40_w = weekly_close.rolling(40).mean()
+                # Determine if weekly 10w MA is above 40w MA (bullish)
+                weekly_trend_ok = bool(sma10_w.iloc[-1] > sma40_w.iloc[-1])
+                if weekly_trend_ok:
+                    score += 0.5
+                    reasons.append("Weekly SMA10 > SMA40 (long-term uptrend)")
+                else:
+                    score -= 0.5
+                    reasons.append("Weekly SMA10 < SMA40 (long-term downtrend)")
+    except Exception:
+        pass
+
     # Momentum
     macd_ok = bool(latest["MACD"] > latest["MACD_signal"] and latest["MACD_hist"] > 0)
     if macd_ok: score += 1.0; reasons.append("MACD > Signal (positive momentum)")
@@ -310,14 +313,32 @@ def analyze_ticker(
     elif rsi_val >= 40: score -= 0.25; reasons.append(f"RSI {rsi_val:.1f} below 50 (weakish)")
     else: score -= 0.75; reasons.append(f"RSI {rsi_val:.1f} weak (<40)")
 
-    # Breakout + volume
+    # Breakout + volume (dynamic volume threshold)
     vol_surge = float(latest["VolSurge"]) if latest["VolSurge"] == latest["VolSurge"] else 1.0
-    near_high = latest["Close"] >= latest["High20"] * 0.997
-    true_breakout = latest["Close"] > latest["High20"] and vol_surge >= 1.5
-    if true_breakout: score += 1.5; reasons.append(f"Breakout with volume (x{vol_surge:.2f})")
-    elif near_high: score += 0.5; reasons.append("Near 20d high")
-    elif latest["Close"] <= latest["Low20"] * 1.003: score -= 1.0; reasons.append("Near 20d low (risk)")
-    if vol_surge >= 1.5: score += 0.75; reasons.append(f"Volume surge x{vol_surge:.2f}")
+    near_high = latest["Close"] >= latest["High20"] * 0.997 if not np.isnan(latest["High20"]) else False
+    # Determine a dynamic volume threshold based on the 80th percentile of the last 20 days
+    vol_threshold_dynamic: float = 1.2
+    try:
+        vol_window = df["VolSurge"].dropna().iloc[-20:]
+        if len(vol_window) >= 5:
+            vol_threshold_dynamic = float(vol_window.quantile(0.8))
+    except Exception:
+        vol_threshold_dynamic = 1.2
+    # True breakout when price closes above the recent high and volume exceeds dynamic threshold
+    true_breakout = (latest["Close"] > latest["High20"]) and (vol_surge >= vol_threshold_dynamic if not np.isnan(vol_surge) else False)
+    if true_breakout:
+        score += 1.5
+        reasons.append(f"Breakout with volume (x{vol_surge:.2f}, thr {vol_threshold_dynamic:.2f})")
+    elif near_high:
+        score += 0.5
+        reasons.append("Near 20d high")
+    elif latest["Close"] <= latest["Low20"] * 1.003 if not np.isnan(latest["Low20"]) else False:
+        score -= 1.0
+        reasons.append("Near 20d low (risk)")
+    # Additional weight when volume surge on its own exceeds threshold
+    if vol_surge >= vol_threshold_dynamic:
+        score += 0.75
+        reasons.append(f"Volume surge x{vol_surge:.2f} (thr {vol_threshold_dynamic:.2f})")
 
     # Volatility penalty
     atr_pct = float(latest["ATR_pct"]) if latest["ATR_pct"] == latest["ATR_pct"] else 0.0
@@ -393,6 +414,27 @@ def analyze_ticker(
     except Exception:
         bb_pos = None
 
+    # Bollinger band width / squeeze detection
+    bb_width_ratio = None
+    try:
+        # Current band width ratio (upper-lower relative to mid)
+        if not np.isnan(bb_mid.iloc[-1]) and bb_mid.iloc[-1] != 0:
+            current_width_ratio = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_mid.iloc[-1]
+        else:
+            current_width_ratio = None
+        width_series = ((bb_upper - bb_lower) / bb_mid).dropna()
+        width_window = width_series.iloc[-100:] if len(width_series) >= 100 else width_series
+        if current_width_ratio is not None:
+            bb_width_ratio = float(current_width_ratio)
+            # Determine a squeeze when current width ratio is in the bottom 20% of the last 100 values
+            if len(width_window) >= 20:
+                width_threshold = float(width_window.quantile(0.2))
+                if bb_width_ratio < width_threshold:
+                    score += 0.25
+                    reasons.append(f"Bollinger squeeze (band width ratio {bb_width_ratio:.3f} < {width_threshold:.3f})")
+    except Exception:
+        bb_width_ratio = None
+
     # ATR-based SL/TP
     sl_mult = cfg.get("sl_atr_mult", 1.5)
     tp_mult = cfg.get("tp_atr_mult", 2.5)
@@ -403,18 +445,34 @@ def analyze_ticker(
         tp_level = round(price + tp_mult * atr_abs, 2)
         reasons.append(f"ATR-based SL/TP: x{sl_mult} / x{tp_mult}")
 
-    # Map to signal + guard
-    buy_th, sell_th = cfg["buy_threshold"], cfg["sell_threshold"]
+    # Map to signal + guard with adaptive thresholds
+    buy_th = cfg["buy_threshold"]
+    sell_th = cfg["sell_threshold"]
+    # Adapt buy/sell thresholds based on market regime when guard is enabled
+    if market_guard:
+        try:
+            if spy_regime_ok:
+                # In a strong market, slightly lower the buy threshold and raise the sell threshold
+                buy_th -= 0.25
+                sell_th += 0.25
+            else:
+                # In a weak market, require higher confidence to buy and more lenient to sell
+                buy_th += 0.25
+                sell_th -= 0.25
+        except Exception:
+            pass
     signal = "HOLD"
-    if score >= buy_th: signal = "BUY"
-    elif score <= sell_th: signal = "SELL"
+    if score >= buy_th:
+        signal = "BUY"
+    elif score <= sell_th:
+        signal = "SELL"
 
-    vol_threshold = 1.2
+    # Guard conditions rely on dynamic volume threshold and relative strength
     rel_ok = (rel20d_pp is not None and rel20d_pp > 0)
-    breakout_vol_ok = (latest["Close"] > latest["High20"] and (float(latest["VolSurge"]) if latest["VolSurge"]==latest["VolSurge"] else 0) >= vol_threshold)
+    breakout_vol_ok = (latest["Close"] > latest["High20"] and (float(latest["VolSurge"]) if latest["VolSurge"]==latest["VolSurge"] else 0) >= vol_threshold_dynamic)
     cond2 = breakout_vol_ok or near_high
     guard_ok = (macd_ok and cond2 and rel_ok and (spy_regime_ok if market_guard else True))
-    if signal == "BUY" and not guard_ok:
+    if signal == "BUY" and not (relax_guards or guard_ok):
         signal = "HOLD"
         reasons.append("Buy guard failed: need MACD>Signal, RelStr>0, (breakout vol≥thr or near-high), and healthy SPY regime")
 
@@ -443,6 +501,8 @@ def analyze_ticker(
             "ext_pct": round(float(ext_pct), 2) if ext_pct is not None else None,
             "rel20d_pp": round(float(rel20d_pp), 2) if rel20d_pp is not None else None,
             "bb_pos": round(float(bb_pos), 2) if bb_pos is not None else None,
+            "bb_width": round(float(bb_width_ratio), 3) if bb_width_ratio is not None else None,
+            "bb_width_pct": round(float(bb_width_ratio) * 100, 2) if bb_width_ratio is not None else None,
             "sl": sl_level, "tp": tp_level,
             "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
@@ -758,6 +818,7 @@ for r in results:
         "ATR %": m.get("atr_pct"),
         "Ext%50d": m.get("ext_pct"),
         "BB pos": m.get("bb_pos"),
+        "BB width (%)": m.get("bb_width_pct"),
         "RelStr20d(pp)": m.get("rel20d_pp"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
         "SL": m.get("sl"),
@@ -813,6 +874,9 @@ for r in results:
         st.text(f"Vol xAvg20: {m.get('vol_surge')}")
         st.text(f"Ext% vs 50d: {m.get('ext_pct')}")
         st.text(f"BB pos (0-1): {m.get('bb_pos')}")
+        # Show the width of the Bollinger channel as a percentage of the midline.  Lower values
+        # indicate compressed volatility, potentially preceding a breakout.
+        st.text(f"BB width (%): {m.get('bb_width_pct')}")
         st.text(f"RelStr 20d vs SPY (pp): {m.get('rel20d_pp')}")
         st.text(f"SL (x{m.get('sl_mult')} ATR): {m.get('sl')}")
         st.text(f"TP (x{m.get('tp_mult')} ATR): {m.get('tp')}")
