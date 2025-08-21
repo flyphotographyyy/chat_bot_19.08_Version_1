@@ -657,16 +657,23 @@ def analyze_ticker(
     else: score -= 0.75; reasons.append(f"RSI {rsi_val:.1f} weak (<40)")
 
     # Breakout + volume (dynamic volume threshold)
+    # compute volume surge factor; default to 1 when missing (i.e., treat missing as neutral)
     vol_surge = float(latest["VolSurge"]) if latest["VolSurge"] == latest["VolSurge"] else 1.0
-    near_high = latest["Close"] >= latest["High20"] * 0.997 if not np.isnan(latest["High20"]) else False
-    # Determine a dynamic volume threshold based on the 80th percentile of the last 20 days
-    vol_threshold_dynamic: float = 1.2
+    # Determine whether price is trading near the recent high.  Allow a slightly wider band (within 0.5% of the 20‑day high)
+    near_high = latest["Close"] >= latest["High20"] * 0.995 if not np.isnan(latest["High20"]) else False
+    # Determine a dynamic volume threshold based on the recent distribution of volume surge.  We use a lower percentile
+    # (60th rather than 80th) to avoid the threshold growing too aggressive.  We also enforce a minimum threshold of 1.1.
+    vol_threshold_dynamic: float = 1.1
     try:
         vol_window = df["VolSurge"].dropna().iloc[-20:]
         if len(vol_window) >= 5:
-            vol_threshold_dynamic = float(vol_window.quantile(0.8))
+            # Use the 60th percentile of the last 20 days to derive the threshold
+            vt = float(vol_window.quantile(0.6))
+            # Ensure the threshold does not fall below 1.1
+            vol_threshold_dynamic = max(1.1, vt)
     except Exception:
-        vol_threshold_dynamic = 1.2
+        # fall back to default
+        vol_threshold_dynamic = 1.1
     # True breakout when price closes above the recent high and volume exceeds dynamic threshold
     true_breakout = (latest["Close"] > latest["High20"]) and (vol_surge >= vol_threshold_dynamic if not np.isnan(vol_surge) else False)
     if true_breakout:
