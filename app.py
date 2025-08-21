@@ -507,6 +507,18 @@ def analyze_ticker(
         eps_growth = fundamentals.get("earningsGrowth")
         # some tickers provide 'debtToEquity' as ratio (e.g. 1.5); fallback to 0 if not available
         debt_to_equity = fundamentals.get("debtToEquity") or fundamentals.get("debtEquity")
+        # extended metrics: EPS values, PEG ratio and cash flow per share.  These help refine valuation.
+        trailing_eps = fundamentals.get("trailingEps")
+        forward_eps = fundamentals.get("forwardEps")
+        peg_ratio = fundamentals.get("pegRatio")
+        shares_out = fundamentals.get("sharesOutstanding")
+        cf_per_share = None
+        try:
+            if free_cash_flow is not None and shares_out:
+                # Protect against division by zero
+                cf_per_share = float(free_cash_flow) / float(shares_out) if float(shares_out) != 0 else None
+        except Exception:
+            cf_per_share = None
     except Exception:
         gross_margin = op_margin = ebitda_margin = None
         free_cash_flow = total_revenue = None
@@ -515,6 +527,11 @@ def analyze_ticker(
         revenue_growth = None
         eps_growth = None
         debt_to_equity = None
+        trailing_eps = None
+        forward_eps = None
+        peg_ratio = None
+        shares_out = None
+        cf_per_share = None
 
     # Compute FCF margin where FCF and revenue are available
     fcf_margin = None
@@ -653,6 +670,50 @@ def analyze_ticker(
         else:
             score -= 0.2
             reasons.append(f"High debt/equity {de:.2f}")
+
+    # PEG ratio scoring
+    # PEG (Price/Earnings to Growth) ratio <1 often indicates growth at a reasonable price.
+    if peg_ratio is not None and isinstance(peg_ratio, (int, float)) and peg_ratio > 0:
+        pr = float(peg_ratio)
+        if pr < 1:
+            score += 0.3
+            reasons.append(f"PEG <1 ({pr:.2f}) — undervalued growth")
+        elif pr < 2:
+            score += 0.1
+            reasons.append(f"PEG moderate {pr:.2f}")
+        elif pr > 4:
+            score -= 0.3
+            reasons.append(f"PEG very high {pr:.2f}")
+        else:
+            score -= 0.15
+            reasons.append(f"PEG elevated {pr:.2f}")
+
+    # Trailing EPS / earnings yield scoring
+    if trailing_eps is not None and price not in [None, np.nan] and price is not None and price != 0:
+        try:
+            eyield = float(trailing_eps) / float(price)
+            # Earnings yield is EPS divided by price; >5% favourable, negative unfavourable
+            if eyield > 0.05:
+                score += 0.2
+                reasons.append(f"Earnings yield {eyield*100:.1f}% (strong)")
+            elif eyield < 0:
+                score -= 0.3
+                reasons.append("Negative earnings")
+        except Exception:
+            pass
+
+    # Cash flow yield scoring (FCF per share / price)
+    if cf_per_share is not None and price not in [None, np.nan] and price is not None and price != 0:
+        try:
+            cfy = float(cf_per_share) / float(price)
+            if cfy > 0.1:
+                score += 0.3
+                reasons.append(f"High cash flow yield {cfy*100:.1f}%")
+            elif cfy < 0.02:
+                score -= 0.2
+                reasons.append(f"Low cash flow yield {cfy*100:.1f}%")
+        except Exception:
+            pass
     # ---------------------------------------------------------------------
 
     # Trend
@@ -1001,6 +1062,19 @@ def analyze_ticker(
         fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
         fm_eps_growth_f = float(eps_growth) if isinstance(eps_growth, (int, float)) else 0.0
         fm_de_ratio_f = float(debt_to_equity) if isinstance(debt_to_equity, (int, float)) else 0.0
+        # Additional fundamental inputs for ML: PEG ratio and cash flow yield
+        fm_peg_ratio_f = 0.0
+        try:
+            if peg_ratio not in [None, np.nan] and peg_ratio is not None:
+                fm_peg_ratio_f = float(peg_ratio)
+        except Exception:
+            fm_peg_ratio_f = 0.0
+        fm_cf_yield_f = 0.0
+        try:
+            if cf_per_share not in [None, np.nan] and price not in [None, np.nan] and price is not None and price != 0:
+                fm_cf_yield_f = float(cf_per_share) / float(price)
+        except Exception:
+            fm_cf_yield_f = 0.0
         for idx in range(20, len(df) - hold_ml):
             # base values
             close_val = close_series.iloc[idx]
@@ -1062,6 +1136,8 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
+                fm_peg_ratio_f,
+                fm_cf_yield_f,
             ]
             # Skip vector if any value is NaN or infinite
             if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
@@ -1134,6 +1210,8 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
+                fm_peg_ratio_f,
+                fm_cf_yield_f,
             ]
             # Standardize last feature vector using training means/stds
             X_last_std = (np.array(f_last) - mean_vec) / std_vec
@@ -1243,57 +1321,6 @@ def analyze_ticker(
             "Buy guard failed: need RelStr>0, healthy SPY regime, and either MACD>Signal or (breakout/near-high/high-volume)"
         )
 
-    # -----------------------------------------------------------------
-    # Sell guard evaluation
-    # Determine if conditions justify exiting a position when the raw score triggers
-    # a SELL.  We check for negative relative strength, negative momentum,
-    # proximity to the recent low, and a volume-driven down move.  A weak
-    # market regime (SPY) is also required when market_guard is enabled.  These
-    # values are exposed in metrics for transparency.
-    sell_rel = None
-    macd_neg = None
-    near_low_flag = None
-    vol_down = None
-    sell_guard_ok = None
-    try:
-        # negative relative strength vs SPY
-        sell_rel = bool(rel20d_pp is not None and rel20d_pp < 0)
-        # negative momentum: MACD below signal OR histogram negative
-        macd_neg = bool(latest.get("MACD", np.nan) < latest.get("MACD_signal", np.nan) or latest.get("MACD_hist", 0) < 0)
-        # close within 1% of 20-day low
-        near_low_flag = False
-        if latest.get("Low20", np.nan) == latest.get("Low20", np.nan):
-            try:
-                near_low_flag = bool(latest["Close"] <= latest["Low20"] * 1.01)
-            except Exception:
-                near_low_flag = False
-        # high volume on downtrend: volume surge >= dynamic threshold AND price below SMA50
-        vol_down = False
-        try:
-            # ensure SMA50 is valid
-            if not np.isnan(latest.get("SMA50", np.nan)):
-                vol_down = bool((vol_surge >= vol_threshold_dynamic) and (latest["Close"] < latest["SMA50"]))
-        except Exception:
-            vol_down = False
-        # combine conditions: require negative relative strength and at least one
-        # of (negative momentum, near-low, volume down).  In a healthy market
-        # regime we avoid selling unless the regime itself is weak.
-        sell_guard_ok = bool(sell_rel and (macd_neg or near_low_flag or vol_down) and ((not spy_regime_ok) if market_guard else True))
-    except Exception:
-        sell_guard_ok = None
-
-    # Enforce sell guard: convert a SELL into HOLD when conditions are not met
-    if signal == "SELL" and not relax_guards:
-        try:
-            if not sell_guard_ok:
-                signal = "HOLD"
-                reasons.append(
-                    "Sell guard failed: need RelStr<0 and either MACD<Signal or (near-low/high-volume downtrend)"
-                )
-        except Exception:
-            # If any error evaluating sell guard, default to holding
-            signal = "HOLD"
-
     ibkr_delta = None
     if optional_ibkr_price is not None and optional_ibkr_price > 0 and price:
         ibkr_delta = ((optional_ibkr_price / price) - 1) * 100
@@ -1349,11 +1376,6 @@ def analyze_ticker(
             # Additional fundamental metrics
             "eps_growth_pct": round(float(eps_growth) * 100, 2) if isinstance(eps_growth, (int, float)) else None,
             "debt_to_equity": round(float(debt_to_equity), 2) if isinstance(debt_to_equity, (int, float)) else None,
-            # Extended earnings/cash metrics
-            "trailing_eps": round(float(trailing_eps), 2) if trailing_eps is not None else None,
-            "forward_eps": round(float(forward_eps), 2) if forward_eps is not None else None,
-            "peg_ratio": round(float(peg_ratio), 2) if peg_ratio is not None else None,
-            "cf_per_share": round(float(cf_per_share), 2) if cf_per_share is not None else None,
             # Sector-relative strength
             "relSector20d_pp": round(float(rel_sector_pp), 2) if rel_sector_pp is not None else None,
             "sl": sl_level, "tp": tp_level,
@@ -1365,15 +1387,6 @@ def analyze_ticker(
                       # simple volume surge flag indicates volume >= 1.3x average
                       "vol_ok_simple": bool(vol_ok_simple),
                       "spy_regime_ok": bool(spy_regime_ok)},
-            # Sell guard status and flags for transparency
-            "sell_guard_ok": bool(sell_guard_ok) if sell_guard_ok is not None else None,
-            "sell_flags": {
-                "sell_rel": bool(sell_rel) if sell_rel is not None else None,
-                "macd_neg": bool(macd_neg) if macd_neg is not None else None,
-                "near_low": bool(near_low_flag) if near_low_flag is not None else None,
-                "vol_down": bool(vol_down) if vol_down is not None else None,
-                "spy_regime_weak": bool(not spy_regime_ok) if spy_regime_ok is not None else None,
-            },
         # ML meta‑signal probability expressed as a percentage.  None if ML model not run.
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
         # Standard deviation of the ML probability across CV folds (percentage points)
