@@ -24,6 +24,161 @@ try:
 except Exception:
     yf = None
 
+# -----------------------------------------------------------------------------
+# Caching layers for price, fundamental and macro data to mitigate repeated
+# yfinance calls and provide basic robustness against network hiccups.  All
+# download functions fallback to empty structures on failure.  Prices are
+# adjusted for splits and dividends via the Adj Close ratio.  The macro
+# function fetches a few broad indicators once per session.
+_price_cache: Dict[Tuple[str, str, str], pd.DataFrame] = {}
+_fundamentals_cache: Dict[str, Dict[str, Any]] = {}
+_macro_cache: Dict[str, Any] = {}
+
+def get_price_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+    """Fetch historical OHLCV data with split adjustment and caching.
+
+    Parameters
+    ----------
+    ticker: str
+        Symbol to download.
+    period: str
+        History period (e.g. '2y').
+    interval: str
+        Data interval (e.g. '1d').
+
+    Returns
+    -------
+    DataFrame
+        Historical data with OHLC adjusted when Adj Close is available.
+    """
+    key = (ticker, period, interval)
+    if key in _price_cache:
+        return _price_cache[key].copy()
+    if yf is None:
+        return pd.DataFrame()
+    try:
+        data = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+        if not data.empty and 'Adj Close' in data.columns and 'Close' in data.columns:
+            try:
+                ratio = data['Adj Close'] / data['Close']
+                data[['Open', 'High', 'Low', 'Close']] = data[['Open', 'High', 'Low', 'Close']].mul(ratio, axis=0)
+            except Exception:
+                pass
+        _price_cache[key] = data.copy()
+        return data
+    except Exception:
+        return pd.DataFrame()
+
+def get_fundamentals(ticker: str) -> Dict[str, Any]:
+    """Retrieve fundamental information for a ticker from yfinance with caching."""
+    if ticker in _fundamentals_cache:
+        return _fundamentals_cache[ticker]
+    if yf is None:
+        _fundamentals_cache[ticker] = {}
+        return {}
+    try:
+        info = yf.Ticker(ticker).fast_info or {}
+        if not info:
+            info = yf.Ticker(ticker).info
+        _fundamentals_cache[ticker] = info.copy() if info else {}
+        return _fundamentals_cache[ticker]
+    except Exception:
+        _fundamentals_cache[ticker] = {}
+        return {}
+
+def get_macro_data() -> Dict[str, Any]:
+    """Download broad macro indicators (once per session) and return them."""
+    if _macro_cache:
+        return _macro_cache
+    result: Dict[str, Any] = {}
+    if yf is None:
+        return result
+    try:
+        yield_data = yf.download("^TNX", period="3mo", interval="1d", progress=False)
+        series_y = _pick_series(yield_data, ["Adj Close", "Close"])
+        if series_y is not None and len(series_y) >= 20:
+            result['macro_yield_change'] = float(series_y.iloc[-1]) - float(series_y.iloc[-20])
+        else:
+            result['macro_yield_change'] = None
+    except Exception:
+        result['macro_yield_change'] = None
+    try:
+        cyc_data = yf.download(["XLY", "XLP"], period="3mo", interval="1d", group_by="ticker", progress=False)
+        def _get_series(data, tkr):
+            for col in ["Adj Close", "Close"]:
+                try:
+                    return data[col][tkr].dropna()
+                except Exception:
+                    continue
+            return None
+        xly_ser = _get_series(cyc_data, "XLY")
+        xlp_ser = _get_series(cyc_data, "XLP")
+        if xly_ser is not None and xlp_ser is not None and len(xly_ser) >= 20 and len(xlp_ser) >= 20:
+            ratio_curr = float(xly_ser.iloc[-1]) / float(xlp_ser.iloc[-1])
+            ratio_prev = float(xly_ser.iloc[-20]) / float(xlp_ser.iloc[-20])
+            result['macro_cyc_ratio'] = ratio_curr / ratio_prev
+        else:
+            result['macro_cyc_ratio'] = None
+    except Exception:
+        result['macro_cyc_ratio'] = None
+    # Additional macro metrics: US Dollar index and oil price change (optional)
+    try:
+        dxy_data = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False)
+        dxy_series = _pick_series(dxy_data, ["Adj Close", "Close"])
+        if dxy_series is not None and len(dxy_series) >= 20:
+            result['usd_change'] = float(dxy_series.iloc[-1]) - float(dxy_series.iloc[-20])
+        else:
+            result['usd_change'] = None
+    except Exception:
+        result['usd_change'] = None
+    # Fetch crude oil (USO) change: already above (oil_change)
+    # Additional macro indicators: consumer price index (CPI) and Federal Funds rate.
+    # These series are available via FRED through yfinance (monthly cadence).  We compute
+    # the change relative to 12 months ago to gauge inflationary and monetary policy trends.
+    try:
+        cpi_data = yf.download("CPIAUCSL", period="2y", interval="1mo", progress=False)
+        cpi_series = _pick_series(cpi_data, ["Adj Close", "Close"])
+        # Compare most recent value to 12 months prior (13 entries back because monthly index includes current month).
+        if cpi_series is not None and len(cpi_series) >= 13:
+            try:
+                latest_cpi = float(cpi_series.iloc[-1])
+                prior_cpi = float(cpi_series.iloc[-13])
+                if prior_cpi != 0:
+                    result['cpi_change'] = (latest_cpi / prior_cpi) - 1.0
+                else:
+                    result['cpi_change'] = None
+            except Exception:
+                result['cpi_change'] = None
+        else:
+            result['cpi_change'] = None
+    except Exception:
+        result['cpi_change'] = None
+    try:
+        fed_data = yf.download("FEDFUNDS", period="2y", interval="1mo", progress=False)
+        fed_series = _pick_series(fed_data, ["Adj Close", "Close"])
+        if fed_series is not None and len(fed_series) >= 13:
+            try:
+                latest_fed = float(fed_series.iloc[-1])
+                prior_fed = float(fed_series.iloc[-13])
+                result['fed_change'] = latest_fed - prior_fed
+            except Exception:
+                result['fed_change'] = None
+        else:
+            result['fed_change'] = None
+    except Exception:
+        result['fed_change'] = None
+    try:
+        oil_data = yf.download("USO", period="3mo", interval="1d", progress=False)
+        oil_series = _pick_series(oil_data, ["Adj Close", "Close"])
+        if oil_series is not None and len(oil_series) >= 20:
+            result['oil_change'] = float(oil_series.iloc[-1]) - float(oil_series.iloc[-20])
+        else:
+            result['oil_change'] = None
+    except Exception:
+        result['oil_change'] = None
+    _macro_cache.update(result)
+    return result
+
 try:
     from streamlit_autorefresh import st_autorefresh
     HAS_AUTOR = True
@@ -33,6 +188,23 @@ except Exception:
 # --- Supabase (free, no disk needed) ---
 from slugify import slugify
 from supabase import create_client, Client
+
+# Additional ML models
+try:
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+
+# Attempt to import XGBoost for more advanced tree-based modelling.  If not
+# available, we fall back to simpler ensembles.  XGBoost can capture
+# complex nonlinear relationships that standard Random Forests and Gradient
+# Boosting may miss.
+try:
+    from xgboost import XGBClassifier  # type: ignore
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
@@ -246,18 +418,20 @@ def _extract_ohlcv_1d(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------- Data ----------------
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_history(ticker: str, days: int = MAX_LOOKBACK_DAYS) -> pd.DataFrame:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days * 2)
-    df = pd.DataFrame()
-    for _ in range(2):
-        try:
-            df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
-        except Exception:
-            df = pd.DataFrame()
-        if df is not None and not df.empty: break
-    if df is None or df.empty: return pd.DataFrame()
-    df = df.rename(columns=lambda c: c.title() if isinstance(c, str) else c)
-    return df.dropna()
+    """Return daily history for a ticker using cached price data.
+
+    To ensure enough data for indicators, we fetch up to 3 years of history and
+    then simply drop NA rows.  The get_price_data function adjusts for splits
+    and dividends automatically.
+    """
+    # Use cached price data; request a long period to cover lookback and moving averages.
+    period = "3y"
+    raw = get_price_data(ticker, period=period, interval="1d")
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    # Title-case column names to match subsequent processing (Open, High, etc.)
+    df = raw.rename(columns=lambda c: c.title() if isinstance(c, str) else c)
+    return df.dropna().copy()
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_info(ticker: str) -> Dict[str, Any]:
@@ -290,13 +464,11 @@ def fetch_spy() -> pd.DataFrame:
 # moving averages. Using Streamlit's cache to avoid repeated downloads.
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_history_weekly(ticker: str, years: int = 3) -> pd.DataFrame:
-    try:
-        # Period must be specified as string e.g. '3y' for yfinance
-        period_str = f"{years}y"
-        df = yf.download(ticker, period=period_str, interval="1wk", progress=False)
-        return df.dropna() if df is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+    """Fetch weekly historical data using cached price data."""
+    # Determine period string; request more years to ensure enough data
+    period_str = f"{years}y"
+    raw = get_price_data(ticker, period=period_str, interval="1wk")
+    return raw.dropna().copy() if raw is not None else pd.DataFrame()
 
 # ---------------- Scoring ----------------
 def analyze_ticker(
@@ -481,6 +653,34 @@ def analyze_ticker(
         elif roe < 0.05:
             score -= 0.3
             reasons.append(f"ROE weak {roe*100:.1f}%")
+    # Compare P/E ratio to sector benchmark when possible.  A P/E below the sector
+    # average may indicate relative value, while a P/E far above suggests
+    # overvaluation.  We use the sector ETF as a proxy to fetch the sector P/E.
+    rel_pe_vs_sector: float | None = None
+    try:
+        sector_name = fundamentals.get("sector")
+        sector_ticker = SECTOR_ETF_MAP.get(sector_name) if sector_name else None
+        if sector_ticker and pe_ratio is not None and pe_ratio > 0:
+            sector_fund = get_fundamentals(sector_ticker) if callable(globals().get('get_fundamentals', None)) else {}
+            # Use trailing P/E or forward P/E for the sector ETF
+            sector_pe = None
+            try:
+                val = sector_fund.get("trailingPE") or sector_fund.get("forwardPE")
+                if val is not None:
+                    sector_pe = float(val)
+            except Exception:
+                sector_pe = None
+            if sector_pe and sector_pe > 0:
+                rel_pe_vs_sector = pe_ratio / sector_pe
+                # Adjust score based on relative valuation
+                if rel_pe_vs_sector < 1:
+                    score += 0.25
+                    reasons.append(f"Rel P/E vs sector low ({rel_pe_vs_sector:.2f})")
+                elif rel_pe_vs_sector > 1.5:
+                    score -= 0.25
+                    reasons.append(f"Rel P/E vs sector high ({rel_pe_vs_sector:.2f})")
+    except Exception:
+        rel_pe_vs_sector = None
     # ---------------------------------------------------------------------
 
     # ---------------------------------------------------------------------
@@ -716,54 +916,62 @@ def analyze_ticker(
             pass
 
     # ---------------------------------------------------------------------
-    # Macro context adjustments
-    # Examine changes in interest rates and risk appetite.  Falling long-term yields (e.g. the
-    # 10-year Treasury) typically support equity valuations, while rising yields can be a headwind.
-    # Compare the consumer discretionary ETF (XLY) to consumer staples (XLP) as a gauge of risk‑on vs
-    # risk‑off sentiment.  Rising XLY/XLP ratios suggest investors favour cyclicals.
-    macro_yield_change = None
-    macro_cyc_ratio = None
-    try:
-        # Download 10-year Treasury yield (^TNX) over ~3 months to compute a 20-day change
-        yield_data = yf.download("^TNX", period="3mo", interval="1d", progress=False)
-        series_y = _pick_series(yield_data, ["Adj Close", "Close"])
-        if series_y is not None and len(series_y) >= 20:
-            macro_yield_change = float(series_y.iloc[-1]) - float(series_y.iloc[-20])
-            # Use basis-point change (0.01 percentage points) for readability
-            if macro_yield_change < 0:
-                score += 0.1
-                reasons.append("10y yield ↓ (rates supportive)")
-            else:
-                score -= 0.1
-                reasons.append("10y yield ↑ (rates headwind)")
-    except Exception:
-        macro_yield_change = None
-    try:
-        # Download cyclical (XLY) and defensive (XLP) ETFs to gauge risk appetite
-        cyc_data = yf.download(["XLY", "XLP"], period="3mo", interval="1d", group_by="ticker", progress=False)
-        # Extract adjusted or closing prices using helper
-        def _get_series(data, ticker):
-            # data is a Panel-like structure returned by yf when passing a list of tickers
-            for col in ["Adj Close", "Close"]:
-                try:
-                    return data[col][ticker].dropna()
-                except Exception:
-                    continue
-            return None
-        xly_ser = _get_series(cyc_data, "XLY")
-        xlp_ser = _get_series(cyc_data, "XLP")
-        if xly_ser is not None and xlp_ser is not None and len(xly_ser) >= 20 and len(xlp_ser) >= 20:
-            ratio_curr = float(xly_ser.iloc[-1]) / float(xlp_ser.iloc[-1])
-            ratio_prev = float(xly_ser.iloc[-20]) / float(xlp_ser.iloc[-20])
-            macro_cyc_ratio = ratio_curr / ratio_prev
-            if macro_cyc_ratio > 1:
-                score += 0.1
-                reasons.append("Macro risk‑on (XLY/XLP rising)")
-            else:
-                score -= 0.1
-                reasons.append("Macro risk‑off (XLY/XLP falling)")
-    except Exception:
-        macro_cyc_ratio = None
+    # Macro context adjustments (cached via get_macro_data)
+    macro = get_macro_data() if callable(globals().get('get_macro_data', None)) else {}
+    macro_yield_change = macro.get('macro_yield_change')
+    macro_cyc_ratio = macro.get('macro_cyc_ratio')
+    usd_change = macro.get('usd_change')
+    oil_change = macro.get('oil_change')
+    cpi_change = macro.get('cpi_change')
+    fed_change = macro.get('fed_change')
+    # Long rates: falling rates support equities; rising rates exert pressure
+    if isinstance(macro_yield_change, (int, float)):
+        if macro_yield_change < 0:
+            score += 0.1
+            reasons.append("10y yield ↓ (rates supportive)")
+        else:
+            score -= 0.1
+            reasons.append("10y yield ↑ (rates headwind)")
+    # Cyc vs defensive ratio: >1 indicates risk‑on sentiment
+    if isinstance(macro_cyc_ratio, (int, float)):
+        if macro_cyc_ratio > 1:
+            score += 0.1
+            reasons.append("Macro risk‑on (XLY/XLP rising)")
+        else:
+            score -= 0.1
+            reasons.append("Macro risk‑off (XLY/XLP falling)")
+    # Dollar strength: a stronger USD can be a headwind for multinationals
+    if isinstance(usd_change, (int, float)):
+        if usd_change > 0:
+            score -= 0.05
+            reasons.append("USD ↑ (strong dollar headwind)")
+        else:
+            score += 0.05
+            reasons.append("USD ↓ (weak dollar tailwind)")
+    # Oil price: rising oil often signals inflation pressure; falling oil supports margins
+    if isinstance(oil_change, (int, float)):
+        if oil_change > 0:
+            score -= 0.05
+            reasons.append("Oil ↑ (inflationary headwind)")
+        else:
+            score += 0.05
+            reasons.append("Oil ↓ (lower cost tailwind)")
+    # CPI: lower inflation is supportive for equities; higher inflation is a headwind
+    if isinstance(cpi_change, (int, float)):
+        if cpi_change < 0:
+            score += 0.1
+            reasons.append("CPI ↓ (lower inflation)")
+        else:
+            score -= 0.1
+            reasons.append("CPI ↑ (higher inflation)")
+    # Fed Funds rate: rising rates tighten financial conditions; falling rates ease them
+    if isinstance(fed_change, (int, float)):
+        if fed_change > 0:
+            score -= 0.1
+            reasons.append("Fed rate ↑ (tightening)")
+        else:
+            score += 0.1
+            reasons.append("Fed rate ↓ (easing)")
     # ---------------------------------------------------------------------
 
     # Trend
@@ -987,9 +1195,12 @@ def analyze_ticker(
     backtest_multi: Dict[int, Dict[str, float | int]] = {}
     backtest_signals_total = 0
     try:
-        hold_periods = [5, 10, 20]
-        lookback_window = 120
-        trade_cost = 0.002  # 0.2% round‑trip cost
+        # Test a broader set of holding periods, up to 180 days, to cater for longer‑term swing or position trades.
+        hold_periods = [5, 10, 20, 40, 60, 90, 180]
+        # Extend lookback window to gather enough samples for longer horizons
+        lookback_window = 240
+        base_trade_cost = 0.002  # Base round‑trip cost for shorter trades (~0.2%)
+        slippage_cost = 0.0005  # Additional slippage cost (~0.05%)
         sl_mult_bt = cfg.get("sl_atr_mult", 1.5)
         tp_mult_bt = cfg.get("tp_atr_mult", 2.5)
         for h in hold_periods:
@@ -1031,7 +1242,9 @@ def analyze_ticker(
                     if exit_price is None and idx + h < len(df):
                         exit_price = float(df["Close"].iloc[idx + h])
                     if exit_price is not None:
-                        ret_h = (exit_price / entry_price) - 1.0 - trade_cost
+                        # Apply trade and slippage costs.  Longer horizons may incur slightly higher costs.
+                        tc = base_trade_cost + (0.0005 if h > 40 else 0)
+                        ret_h = (exit_price / entry_price) - 1.0 - (tc + slippage_cost)
                         returns_h.append(ret_h)
                         count_h += 1
             win_rate_h = float(sum(1 for x in returns_h if x > 0) / len(returns_h)) if returns_h else None
@@ -1125,6 +1338,14 @@ def analyze_ticker(
                 fm_cf_yield_f = float(cf_per_share) / float(price)
         except Exception:
             fm_cf_yield_f = 0.0
+        # Relative P/E vs sector constant for ML features
+        fm_rel_pe_sector_f = 1.0
+        try:
+            if rel_pe_vs_sector not in [None, np.nan] and rel_pe_vs_sector is not None:
+                fm_rel_pe_sector_f = float(rel_pe_vs_sector)
+        except Exception:
+            fm_rel_pe_sector_f = 1.0
+
         for idx in range(20, len(df) - hold_ml):
             # base values
             close_val = close_series.iloc[idx]
@@ -1188,6 +1409,7 @@ def analyze_ticker(
                 fm_de_ratio_f,
                 fm_peg_ratio_f,
                 fm_cf_yield_f,
+                fm_rel_pe_sector_f,
             ]
             # Skip vector if any value is NaN or infinite
             if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
@@ -1262,6 +1484,7 @@ def analyze_ticker(
                 fm_de_ratio_f,
                 fm_peg_ratio_f,
                 fm_cf_yield_f,
+                fm_rel_pe_sector_f,
             ]
             # Standardize last feature vector using training means/stds
             X_last_std = (np.array(f_last) - mean_vec) / std_vec
@@ -1292,6 +1515,48 @@ def analyze_ticker(
                 prob_fallback = _predict_logistic_numpy(X_last_std.reshape(1, -1), weights_ml, bias_ml)[0]
                 ml_prob = float(prob_fallback)
                 ml_prob_std = 0.0
+
+            # -----------------------------------------------------------------
+            # Additional machine learning models (Random Forest & Gradient Boosting)
+            # to capture nonlinear patterns.  We train on the standardized feature matrix
+            # using scikit-learn if available.  The probabilities from each model are
+            # combined (simple average) with the logistic probability; the standard
+            # deviation across models quantifies uncertainty.
+            if HAS_SKLEARN and ml_prob is not None:
+                try:
+                    # Random Forest
+                    rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
+                    rf.fit(X_std, y_raw)
+                    rf_prob = float(rf.predict_proba(X_last_std.reshape(1, -1))[0][1])
+                    # Gradient Boosting
+                    gb = GradientBoostingClassifier(n_estimators=50, learning_rate=0.1, max_depth=3, random_state=42)
+                    gb.fit(X_std, y_raw)
+                    gb_prob = float(gb.predict_proba(X_last_std.reshape(1, -1))[0][1])
+                    # Optionally include XGBoost if installed
+                    probs = [ml_prob, rf_prob, gb_prob]
+                    if globals().get('HAS_XGB', False):
+                        try:
+                            xgb_model = XGBClassifier(
+                                n_estimators=50,
+                                max_depth=3,
+                                learning_rate=0.1,
+                                subsample=0.8,
+                                colsample_bytree=0.8,
+                                use_label_encoder=False,
+                                eval_metric='logloss',
+                                random_state=42,
+                            )
+                            xgb_model.fit(X_std, y_raw)
+                            xgb_prob = float(xgb_model.predict_proba(X_last_std.reshape(1, -1))[0][1])
+                            probs.append(xgb_prob)
+                        except Exception:
+                            pass
+                    # Combine probabilities from all available models
+                    ml_prob = float(np.mean(probs))
+                    ml_prob_std = float(np.std(probs))
+                except Exception:
+                    # If sklearn training fails, keep original ml_prob and std
+                    pass
     except Exception:
         ml_prob = None
 
@@ -1371,28 +1636,52 @@ def analyze_ticker(
             "Buy guard failed: need RelStr>0, healthy SPY regime, and either MACD>Signal or (breakout/near-high/high-volume)"
         )
 
-    # ---------------- SELL GUARD -----------------
-    # Determine conditions for a sell confirmation.  Require negative relative strength,
-    # and at least one of: negative momentum (MACD below signal and histogram <0), price near 20d low,
-    # or a significant volume surge on decline.  Additionally, a weak SPY regime is needed when market_guard
-    # is enabled.  These checks help avoid premature exits during normal pullbacks.
-    sell_rel = bool(rel20d_pp is not None and rel20d_pp < 0)
-    # Negative momentum: MACD below its signal and histogram negative indicates downside pressure.
+    # ---------------------------------------------------------------------
+    # Sell guard logic: evaluate conditions for a sell recommendation.  Even if
+    # the raw score falls below the sell threshold, we require additional
+    # confirmation to avoid exiting positions prematurely in a strong market.
+    # Conditions include negative relative strength, negative momentum,
+    # proximity to 20‑day lows, high volume down days, or the stop level being hit.
+    # We intentionally do not require a weak SPY regime to trigger a sell, so that
+    # risk management signals can act regardless of broad market strength.
+    sell_rel_neg = bool(rel20d_pp is not None and rel20d_pp < 0)
     macd_neg = bool(latest["MACD"] < latest["MACD_signal"] and latest["MACD_hist"] < 0)
-    # Near 20-day low: within 1% of recent low suggests breakdown risk.
-    near_low = bool(latest["Close"] <= latest["Low20"] * 1.01) if not np.isnan(latest["Low20"]) else False
-    # High volume down: use the same dynamic threshold but require volume surge to exceed it.
-    vol_down = bool(vol_surge >= max(1.3, vol_threshold_dynamic))
-    # Determine whether overall conditions warrant a sell guard pass.
-    spy_weak = not spy_regime_ok if market_guard else False
-    sell_cond = macd_neg or near_low or vol_down
-    sell_guard_ok = sell_rel and sell_cond and (spy_weak or not market_guard)
+    # consider price near the 20‑day low if it is within 1% of the low
+    near_low = False
+    try:
+        if not np.isnan(latest.get("Low20", np.nan)) and latest.get("Low20") > 0 and price is not None:
+            near_low = bool(price <= float(latest["Low20"]) * 1.01)
+    except Exception:
+        near_low = False
+    # high volume down day: volume >= dynamic threshold and price down vs previous close
+    high_volume_down = False
+    try:
+        if price is not None and prev is not None and not np.isnan(latest.get("VolSurge", np.nan)):
+            down = float(price) < float(prev["Close"])
+            high_volume_down = bool(down and float(latest["VolSurge"]) >= vol_threshold_dynamic)
+    except Exception:
+        high_volume_down = False
+    # Stop loss hit: price below calculated stop level
+    sl_hit = False
+    try:
+        if sl_level is not None and price is not None:
+            sl_hit = bool(price <= sl_level)
+    except Exception:
+        sl_hit = False
+    # Weak SPY regime for information (not required to sell)
+    spy_regime_weak = not bool(spy_regime_ok)
+    # Determine overall sell guard: require negative relative strength and at least one additional
+    # bearish trigger or stop hit
+    sell_guard_ok = bool(sell_rel_neg and (macd_neg or near_low or high_volume_down or sl_hit))
+    # Override: if stop level is hit, allow sell even if relative strength is not negative
+    if sl_hit:
+        sell_guard_ok = True
 
-    if signal == "SELL" and not (relax_guards or sell_guard_ok):
-        # downgrade to HOLD if sell guard fails
+    # If a SELL signal is triggered by the score but sell guard fails and guards are enforced, revert to HOLD
+    if signal == "SELL" and not relax_guards and not sell_guard_ok:
         signal = "HOLD"
         reasons.append(
-            "Sell guard failed: need RelStr<0, weak SPY regime, and at least one of (MACD<Signal, near‑low, high‑volume down)"
+            "Sell guard failed: need RelStr<0 and either MACD<Signal, near-low, high-volume down, or SL hit"
         )
 
     ibkr_delta = None
@@ -1439,6 +1728,14 @@ def analyze_ticker(
             "backtest10_avg_return_pct": round(backtest_multi.get(10, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(10, {}).get("avg_ret") is not None else None,
             "backtest20_win_rate_pct": round(backtest_multi.get(20, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(20, {}).get("win_rate") is not None else None,
             "backtest20_avg_return_pct": round(backtest_multi.get(20, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(20, {}).get("avg_ret") is not None else None,
+            "backtest40_win_rate_pct": round(backtest_multi.get(40, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(40, {}).get("win_rate") is not None else None,
+            "backtest40_avg_return_pct": round(backtest_multi.get(40, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(40, {}).get("avg_ret") is not None else None,
+            "backtest60_win_rate_pct": round(backtest_multi.get(60, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(60, {}).get("win_rate") is not None else None,
+            "backtest60_avg_return_pct": round(backtest_multi.get(60, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(60, {}).get("avg_ret") is not None else None,
+            "backtest90_win_rate_pct": round(backtest_multi.get(90, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(90, {}).get("win_rate") is not None else None,
+            "backtest90_avg_return_pct": round(backtest_multi.get(90, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(90, {}).get("avg_ret") is not None else None,
+            "backtest180_win_rate_pct": round(backtest_multi.get(180, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(180, {}).get("win_rate") is not None else None,
+            "backtest180_avg_return_pct": round(backtest_multi.get(180, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(180, {}).get("avg_ret") is not None else None,
             # Extended fundamental metrics
             "gross_margin_pct": round(float(gross_margin) * 100, 2) if isinstance(gross_margin, (int, float)) else None,
             "operating_margin_pct": round(float(op_margin) * 100, 2) if isinstance(op_margin, (int, float)) else None,
@@ -1450,32 +1747,46 @@ def analyze_ticker(
             # Additional fundamental metrics
             "eps_growth_pct": round(float(eps_growth) * 100, 2) if isinstance(eps_growth, (int, float)) else None,
             "debt_to_equity": round(float(debt_to_equity), 2) if isinstance(debt_to_equity, (int, float)) else None,
+            # Legacy key for backward compatibility in UI (Debt/Equity)
+            "de_ratio": round(float(debt_to_equity), 2) if isinstance(debt_to_equity, (int, float)) else None,
+            # Relative valuation vs sector (P/E)
+            "rel_pe_vs_sector": round(float(rel_pe_vs_sector), 2) if rel_pe_vs_sector is not None else None,
             # Sector-relative strength
             "relSector20d_pp": round(float(rel_sector_pp), 2) if rel_sector_pp is not None else None,
             "sl": sl_level, "tp": tp_level,
             "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
-            "flags": {"macd_ok": bool(macd_ok), "rel_ok": bool(rel_ok),
-                      "near_high": bool(near_high),
-                      "breakout_vol_ok": bool(breakout_vol_ok),
-                      # simple volume surge flag indicates volume >= 1.3x average
-                      "vol_ok_simple": bool(vol_ok_simple),
-                      "spy_regime_ok": bool(spy_regime_ok)},
+            # Sell guard status and flags
+            "sell_guard_ok": bool(sell_guard_ok),
+            "sell_flags": {
+                "rel_neg": bool(sell_rel_neg),
+                "macd_neg": bool(macd_neg),
+                "near_low": bool(near_low),
+                "high_volume_down": bool(high_volume_down),
+                "sl_hit": bool(sl_hit),
+                "spy_regime_weak": bool(spy_regime_weak)
+            },
+            "flags": {
+                "macd_ok": bool(macd_ok),
+                "rel_ok": bool(rel_ok),
+                "near_high": bool(near_high),
+                "breakout_vol_ok": bool(breakout_vol_ok),
+                # simple volume surge flag indicates volume >= 1.3x average
+                "vol_ok_simple": bool(vol_ok_simple),
+                "spy_regime_ok": bool(spy_regime_ok)
+            },
+            # Macro metrics recorded for display in the UI
+            "macro_yield_change": macro_yield_change,
+            "macro_cyc_ratio": macro_cyc_ratio,
+            "usd_change": usd_change,
+            "oil_change": oil_change,
+            "cpi_change": cpi_change,
+            "fed_change": fed_change,
+            # Sell guard metrics will be added below
         # ML meta‑signal probability expressed as a percentage.  None if ML model not run.
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
         # Standard deviation of the ML probability across CV folds (percentage points)
         "ml_prob_std_pct": round(ml_prob_std * 100, 2) if ml_prob_std is not None else None,
-            # Additional valuation metrics
-            "trailing_eps": round(float(trailing_eps), 2) if trailing_eps is not None else None,
-            "forward_eps": round(float(forward_eps), 2) if forward_eps is not None else None,
-            "peg_ratio": round(float(peg_ratio), 2) if peg_ratio is not None else None,
-            "cf_per_share": round(float(cf_per_share), 2) if cf_per_share is not None else None,
-            # Macro metrics
-            "macro_yield_change": round(float(macro_yield_change), 2) if macro_yield_change is not None else None,
-            "macro_cyc_ratio": round(float(macro_cyc_ratio), 2) if macro_cyc_ratio is not None else None,
-            # Sell guard flags and status
-            "sell_guard_ok": bool(sell_guard_ok),
-            "sell_flags": {"rel_neg": bool(sell_rel), "macd_neg": bool(macd_neg), "near_low": bool(near_low), "vol_down": bool(vol_down), "spy_regime_weak": bool(spy_weak)},
         },
         "explanations": reasons,
     })
@@ -1802,11 +2113,11 @@ for r in results:
         "Leverage (ND/EBITDA)": m.get("net_debt_ebitda"),
             "ML Prob (%)": m.get("ml_prob_pct"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
+        "SellGuard": "OK" if m.get("sell_guard_ok") else "Fail",
         "SL": m.get("sl"),
         "TP": m.get("tp"),
         "Days→Earn": m.get("days_to_earnings"),
         "IBKR Δ%": m.get("ibkr_delta_pct"),
-        "SellGuard": "OK" if m.get("sell_guard_ok") else "Fail",
     })
 
 summary_df = pd.DataFrame(rows)
@@ -1931,8 +2242,11 @@ for r in results:
             metrics_list.append(("CF per share", m.get("cf_per_share")))
         if m.get("eps_growth_pct") is not None:
             metrics_list.append(("EPS growth", f"{m.get('eps_growth_pct')}%"))
-        if m.get("debt_to_equity") is not None:
-            metrics_list.append(("Debt/Equity", m.get("debt_to_equity")))
+        if m.get("de_ratio") is not None:
+            metrics_list.append(("Debt/Equity", m.get("de_ratio")))
+            # Add relative P/E to sector immediately after debt/equity if available.
+            if m.get("rel_pe_vs_sector") is not None:
+                metrics_list.append(("Rel P/E vs sector", m.get("rel_pe_vs_sector")))
 
         # Sector and other margin metrics
         if m.get("relSector20d_pp") is not None:
@@ -1974,6 +2288,18 @@ for r in results:
             metrics_list.append(("BT40 win rate", f"{m.get('backtest40_win_rate_pct')}%"))
         if m.get("backtest40_avg_return_pct") is not None:
             metrics_list.append(("BT40 avg return", f"{m.get('backtest40_avg_return_pct')}%"))
+        if m.get("backtest60_win_rate_pct") is not None:
+            metrics_list.append(("BT60 win rate", f"{m.get('backtest60_win_rate_pct')}%"))
+        if m.get("backtest60_avg_return_pct") is not None:
+            metrics_list.append(("BT60 avg return", f"{m.get('backtest60_avg_return_pct')}%"))
+        if m.get("backtest90_win_rate_pct") is not None:
+            metrics_list.append(("BT90 win rate", f"{m.get('backtest90_win_rate_pct')}%"))
+        if m.get("backtest90_avg_return_pct") is not None:
+            metrics_list.append(("BT90 avg return", f"{m.get('backtest90_avg_return_pct')}%"))
+        if m.get("backtest180_win_rate_pct") is not None:
+            metrics_list.append(("BT180 win rate", f"{m.get('backtest180_win_rate_pct')}%"))
+        if m.get("backtest180_avg_return_pct") is not None:
+            metrics_list.append(("BT180 avg return", f"{m.get('backtest180_avg_return_pct')}%"))
 
         # ML and macro metrics
         if m.get("ml_prob_pct") is not None:
@@ -1982,6 +2308,18 @@ for r in results:
             metrics_list.append(("10y yield Δ (20d)", f"{m.get('macro_yield_change'):.2f} bp"))
         if m.get("macro_cyc_ratio") is not None:
             metrics_list.append(("XLY/XLP ratio", f"{m.get('macro_cyc_ratio'):.2f}"))
+        # Additional macro metrics: dollar change, oil change, CPI and Fed rate changes.
+        if m.get("usd_change") is not None:
+            metrics_list.append(("USD Δ (20d)", f"{m.get('usd_change'):.2f}"))
+        if m.get("oil_change") is not None:
+            metrics_list.append(("Oil Δ (20d)", f"{m.get('oil_change'):.2f}"))
+        if m.get("cpi_change") is not None:
+            try:
+                metrics_list.append(("CPI Δ (12mo)", f"{m.get('cpi_change')*100:.2f}%"))
+            except Exception:
+                metrics_list.append(("CPI Δ (12mo)", m.get('cpi_change')))
+        if m.get("fed_change") is not None:
+            metrics_list.append(("Fed rate Δ (12mo)", f"{m.get('fed_change'):.2f}"))
 
         # Distribute metrics across columns evenly
         cols = [col1, col2, col3]
@@ -2064,15 +2402,18 @@ Approx. R:R: {rr_text}
         st.write(f"Breakout / NearHigh / VolOK: {b(flags.get('breakout_vol_ok') or flags.get('near_high') or flags.get('vol_ok_simple'))} (vol xAvg20: {m.get('vol_surge')})")
         st.write(f"SPY regime OK: {b(flags.get('spy_regime_ok'))}")
 
-    # SellGuard checks display: similar layout to BuyGuard but for exit conditions
+    # Show SellGuard diagnostics in a separate expander.  This helps users
+    # understand why a SELL signal was or was not issued.  Each flag must be
+    # negative to contribute to a sell recommendation.
     with st.expander("🛑 SellGuard checks"):
-        sflags = m.get("sell_flags", {})
-        def b_s(v): return "✅" if v else "❌"
-        st.write(f"RelStr20d<0: {b_s(sflags.get('rel_neg'))} (val: {m.get('rel20d_pp')})")
-        st.write(f"MACD<Signal: {b_s(sflags.get('macd_neg'))}")
-        st.write(f"Near 20d low: {b_s(sflags.get('near_low'))}")
-        st.write(f"High volume down: {b_s(sflags.get('vol_down'))} (vol xAvg20: {m.get('vol_surge')})")
-        st.write(f"SPY regime weak: {b_s(sflags.get('spy_regime_weak'))}")
+        sflags = m.get("sell_flags", {}) if isinstance(m, dict) else {}
+        def bs(v): return "✅" if v else "❌"
+        st.write(f"RelStr20d<0: {bs(sflags.get('rel_neg'))} (val: {m.get('rel20d_pp')})")
+        st.write(f"MACD<Signal: {bs(sflags.get('macd_neg'))}")
+        st.write(f"Near 20d low: {bs(sflags.get('near_low'))}")
+        st.write(f"High volume down: {bs(sflags.get('high_volume_down'))} (vol xAvg20: {m.get('vol_surge')})")
+        st.write(f"SL hit: {bs(sflags.get('sl_hit'))}")
+        st.write(f"SPY regime weak: {bs(sflags.get('spy_regime_weak'))}")
 
     with st.expander("🤖 Why this signal?"):
         for reason in r.get("explanations", []):
