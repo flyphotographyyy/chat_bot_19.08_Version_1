@@ -235,30 +235,10 @@ def _pick_series(df: pd.DataFrame, keys: List[str]) -> pd.Series:
     return pd.Series(dtype=float)
 
 def _extract_ohlcv_1d(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Extract the Open, High, Low, Close and Volume columns from a yfinance
-    DataFrame.  When both "Close" and "Adj Close" columns are present, prefer
-    the adjusted close for the Close field.  This mitigates the impact of
-    stock splits or dividend adjustments on our calculations.  All columns
-    returned are converted to numeric and rows with any missing values are
-    dropped.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw yfinance DataFrame containing at least OHLCV columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        A DataFrame with columns [Open, High, Low, Close, Volume].  Any
-        row containing NaNs is removed.
-    """
     o = _pick_series(df, ["Open"])
     h = _pick_series(df, ["High"])
     l = _pick_series(df, ["Low"])
-    # Prefer adjusted close over raw close when available to account for splits/dividends
-    c = _pick_series(df, ["Adj Close", "Close"])
+    c = _pick_series(df, ["Close", "Adj Close"])
     v = _pick_series(df, ["Volume"])
     out = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
     return out.dropna()
@@ -527,17 +507,6 @@ def analyze_ticker(
         eps_growth = fundamentals.get("earningsGrowth")
         # some tickers provide 'debtToEquity' as ratio (e.g. 1.5); fallback to 0 if not available
         debt_to_equity = fundamentals.get("debtToEquity") or fundamentals.get("debtEquity")
-        # extended metrics: EPS values, PEG ratio and cash flow per share.  These help refine valuation.
-        trailing_eps = fundamentals.get("trailingEps")
-        forward_eps = fundamentals.get("forwardEps")
-        peg_ratio = fundamentals.get("pegRatio")
-        shares_out = fundamentals.get("sharesOutstanding")
-        cf_per_share = None
-        try:
-            if free_cash_flow is not None and shares_out:
-                cf_per_share = float(free_cash_flow) / float(shares_out) if float(shares_out) != 0 else None
-        except Exception:
-            cf_per_share = None
     except Exception:
         gross_margin = op_margin = ebitda_margin = None
         free_cash_flow = total_revenue = None
@@ -546,11 +515,6 @@ def analyze_ticker(
         revenue_growth = None
         eps_growth = None
         debt_to_equity = None
-        trailing_eps = None
-        forward_eps = None
-        peg_ratio = None
-        shares_out = None
-        cf_per_share = None
 
     # Compute FCF margin where FCF and revenue are available
     fcf_margin = None
@@ -689,50 +653,6 @@ def analyze_ticker(
         else:
             score -= 0.2
             reasons.append(f"High debt/equity {de:.2f}")
-
-    # PEG ratio scoring
-    # PEG (Price/Earnings to Growth) ratio <1 often indicates growth at a reasonable price.
-    if peg_ratio is not None and isinstance(peg_ratio, (int, float)) and peg_ratio > 0:
-        pr = float(peg_ratio)
-        if pr < 1:
-            score += 0.3
-            reasons.append(f"PEG <1 ({pr:.2f}) — undervalued growth")
-        elif pr < 2:
-            score += 0.1
-            reasons.append(f"PEG moderate {pr:.2f}")
-        elif pr > 4:
-            score -= 0.3
-            reasons.append(f"PEG very high {pr:.2f}")
-        else:
-            score -= 0.15
-            reasons.append(f"PEG elevated {pr:.2f}")
-
-    # Trailing EPS / earnings yield scoring
-    if trailing_eps is not None and price not in [None, np.nan] and price is not None and price != 0:
-        try:
-            eyield = float(trailing_eps) / float(price)
-            # Earnings yield is EPS divided by price; >5% favourable, negative unfavourable
-            if eyield > 0.05:
-                score += 0.2
-                reasons.append(f"Earnings yield {eyield*100:.1f}% (strong)")
-            elif eyield < 0:
-                score -= 0.3
-                reasons.append("Negative earnings")
-        except Exception:
-            pass
-
-    # Cash flow yield scoring (FCF per share / price)
-    if cf_per_share is not None and price not in [None, np.nan] and price is not None and price != 0:
-        try:
-            cfy = float(cf_per_share) / float(price)
-            if cfy > 0.1:
-                score += 0.3
-                reasons.append(f"High cash flow yield {cfy*100:.1f}%")
-            elif cfy < 0.02:
-                score -= 0.2
-                reasons.append(f"Low cash flow yield {cfy*100:.1f}%")
-        except Exception:
-            pass
     # ---------------------------------------------------------------------
 
     # Trend
@@ -883,47 +803,6 @@ def analyze_ticker(
     except Exception:
         rel_sector_pp = None
 
-    # ---------------------------------------------------------------------
-    # Macro context: interest rate trend and risk appetite
-    # Rising long-term yields tend to pressure high-growth equities, while
-    # falling yields provide support.  A positive performance of consumer
-    # discretionary vs staples ETFs (XLY vs XLP) indicates a risk-on environment.
-    macro_yield_change = None
-    macro_cyc_ratio = None
-    try:
-        # 10-year Treasury yield index (e.g. ^TNX) – note: yields are expressed in percent.
-        raw_tnx = fetch_history("^TNX")
-        tnx_df = _extract_ohlcv_1d(raw_tnx) if raw_tnx is not None and not raw_tnx.empty else None
-        if tnx_df is not None and not tnx_df.empty and len(tnx_df) > 21:
-            ch = (tnx_df["Close"].iloc[-1] / tnx_df["Close"].iloc[-21]) - 1
-            macro_yield_change = float(ch)
-            if ch > 0.1:
-                score -= 0.25
-                reasons.append(f"10Y yield up {ch*100:.1f}% (macro headwind)")
-            elif ch < -0.1:
-                score += 0.25
-                reasons.append(f"10Y yield down {abs(ch)*100:.1f}% (macro tailwind)")
-    except Exception:
-        macro_yield_change = None
-    try:
-        raw_xly = fetch_history("XLY")
-        raw_xlp = fetch_history("XLP")
-        xly_df = _extract_ohlcv_1d(raw_xly) if raw_xly is not None and not raw_xly.empty else None
-        xlp_df = _extract_ohlcv_1d(raw_xlp) if raw_xlp is not None and not raw_xlp.empty else None
-        if xly_df is not None and not xly_df.empty and xlp_df is not None and not xlp_df.empty and len(xly_df) > 21 and len(xlp_df) > 21:
-            r_xly = xly_df["Close"].iloc[-1] / xly_df["Close"].iloc[-21] - 1
-            r_xlp = xlp_df["Close"].iloc[-1] / xlp_df["Close"].iloc[-21] - 1
-            cyc_ratio = float(r_xly - r_xlp)
-            macro_cyc_ratio = cyc_ratio
-            if cyc_ratio > 0:
-                score += 0.2
-                reasons.append("Macro risk-on (XLY outperforming XLP)")
-            else:
-                score -= 0.2
-                reasons.append("Macro risk-off (XLY underperforming XLP)")
-    except Exception:
-        macro_cyc_ratio = None
-
     # Earnings blackout
     if days_to_earn is not None and days_to_earn <= cfg["earnings_blackout_days"]:
         allowed = False
@@ -997,22 +876,9 @@ def analyze_ticker(
     backtest_multi: Dict[int, Dict[str, float | int]] = {}
     backtest_signals_total = 0
     try:
-        hold_periods = [5, 10, 20, 40]
+        hold_periods = [5, 10, 20]
         lookback_window = 120
-        # Dynamic transaction cost: larger, liquid names/ETFs have lower fees; small caps incur higher slippage
-        base_cost = 0.002
-        # Determine base trade cost using current price and ticker type
-        trade_cost = base_cost
-        try:
-            if price not in [None, np.nan] and price is not None:
-                if price >= 200 or ticker.upper() in {"SPY", "QQQ", "IWM", "TLT", "XLK", "XLV", "XLE", "XLF", "XLY", "XLP", "XLU", "XLI", "XLB", "XLRE", "XLC"}:
-                    trade_cost = 0.001  # 0.1% for large caps and ETFs
-                elif price < 20:
-                    trade_cost = 0.003  # 0.3% for small caps / low liquidity
-                else:
-                    trade_cost = 0.002  # default 0.2%
-        except Exception:
-            trade_cost = 0.002
+        trade_cost = 0.002  # 0.2% round‑trip cost
         sl_mult_bt = cfg.get("sl_atr_mult", 1.5)
         tp_mult_bt = cfg.get("tp_atr_mult", 2.5)
         for h in hold_periods:
@@ -1035,45 +901,26 @@ def analyze_ticker(
                     atr_entry = float(row.get("ATR14", 0.0)) if row.get("ATR14", np.nan) == row.get("ATR14", np.nan) else 0.0
                     stop_price = entry_price - sl_mult_bt * atr_entry if atr_entry > 0 else None
                     target_price = entry_price + tp_mult_bt * atr_entry if atr_entry > 0 else None
-                    # Initialize exit prices for partial exits
-                    exit1 = None  # exit price for first half (target)
-                    exit2 = None  # exit price for second half (remainder)
-                    # iterate through holding window to apply trailing stop / target, allowing partial exits
+                    exit_price = None
+                    # iterate through holding window to apply trailing stop / target
                     for j in range(1, h + 1):
                         if idx + j >= len(df):
                             break
                         p_close = float(df["Close"].iloc[idx + j])
                         p_low = float(df["Low"].iloc[idx + j])
-                        # If stop is hit, both halves exit immediately
+                        # check trailing stop
                         if stop_price is not None and p_low <= stop_price:
-                            exit1 = stop_price if exit1 is None else exit1
-                            exit2 = stop_price
+                            exit_price = stop_price
                             break
-                        # Trigger first half take profit
-                        if exit1 is None and target_price is not None and p_close >= target_price:
-                            exit1 = target_price
-                            # continue searching for second exit but with same stop
-                            continue
-                        # After first exit, look for stop on second half
-                        if exit1 is not None and exit2 is None:
-                            if stop_price is not None and p_low <= stop_price:
-                                exit2 = stop_price
-                                break
-                    # After scanning the holding window, assign defaults
-                    if exit1 is None and exit2 is None:
-                        # No triggers: full position held to end
-                        if idx + h < len(df):
-                            exit1 = exit2 = float(df["Close"].iloc[idx + h])
-                    elif exit1 is not None and exit2 is None:
-                        # First half exited at target; second half exits at horizon
-                        if idx + h < len(df):
-                            exit2 = float(df["Close"].iloc[idx + h])
-                    # If only second exit triggered (e.g. stop) and exit1 is None, set both equal
-                    if exit2 is not None and exit1 is None:
-                        exit1 = exit2
-                    # Calculate combined return if we have both exit prices
-                    if exit1 is not None and exit2 is not None:
-                        ret_h = 0.5 * ((exit1 / entry_price) - 1.0) + 0.5 * ((exit2 / entry_price) - 1.0) - trade_cost
+                        # optional: take profit if price exceeds target
+                        if target_price is not None and p_close >= target_price:
+                            exit_price = target_price
+                            break
+                    # if no stop or target was hit, sell at end of horizon
+                    if exit_price is None and idx + h < len(df):
+                        exit_price = float(df["Close"].iloc[idx + h])
+                    if exit_price is not None:
+                        ret_h = (exit_price / entry_price) - 1.0 - trade_cost
                         returns_h.append(ret_h)
                         count_h += 1
             win_rate_h = float(sum(1 for x in returns_h if x > 0) / len(returns_h)) if returns_h else None
@@ -1154,15 +1001,6 @@ def analyze_ticker(
         fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
         fm_eps_growth_f = float(eps_growth) if isinstance(eps_growth, (int, float)) else 0.0
         fm_de_ratio_f = float(debt_to_equity) if isinstance(debt_to_equity, (int, float)) else 0.0
-        # Additional fundamental inputs for ML: PEG ratio and cash flow yield
-        fm_peg_ratio_f = float(peg_ratio) if (peg_ratio not in [None, np.nan] and peg_ratio is not None) else 0.0
-        try:
-            if cf_per_share not in [None, np.nan] and price not in [None, np.nan] and price is not None and price != 0:
-                fm_cf_yield_f = float(cf_per_share) / float(price)
-            else:
-                fm_cf_yield_f = 0.0
-        except Exception:
-            fm_cf_yield_f = 0.0
         for idx in range(20, len(df) - hold_ml):
             # base values
             close_val = close_series.iloc[idx]
@@ -1224,8 +1062,6 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
-                fm_peg_ratio_f,
-                fm_cf_yield_f,
             ]
             # Skip vector if any value is NaN or infinite
             if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
@@ -1298,8 +1134,6 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
-                fm_peg_ratio_f,
-                fm_cf_yield_f,
             ]
             # Standardize last feature vector using training means/stds
             X_last_std = (np.array(f_last) - mean_vec) / std_vec
@@ -1330,43 +1164,6 @@ def analyze_ticker(
                 prob_fallback = _predict_logistic_numpy(X_last_std.reshape(1, -1), weights_ml, bias_ml)[0]
                 ml_prob = float(prob_fallback)
                 ml_prob_std = 0.0
-
-            # -----------------------------------------------------------------
-            # Simple ensemble tree (random decision stumps) to diversify ML signal
-            rf_prob = None
-            try:
-                if X_std.shape[0] >= 20 and X_std.shape[1] > 0:
-                    n_trees = 10
-                    rf_probs: List[float] = []
-                    rng = np.random.default_rng(seed=42)
-                    for _ in range(n_trees):
-                        # pick a random feature index
-                        f_idx = int(rng.integers(low=0, high=X_std.shape[1]))
-                        col = X_std[:, f_idx]
-                        thr = float(np.median(col))
-                        above_mask = col >= thr
-                        below_mask = col < thr
-                        # compute positive probabilities for each branch
-                        if above_mask.sum() > 0:
-                            pos_prob_above = float(np.mean(y_raw[above_mask]))
-                        else:
-                            pos_prob_above = float(np.mean(y_raw))
-                        if below_mask.sum() > 0:
-                            pos_prob_below = float(np.mean(y_raw[below_mask]))
-                        else:
-                            pos_prob_below = float(np.mean(y_raw))
-                        # evaluate current observation
-                        if X_last_std[f_idx] >= thr:
-                            rf_probs.append(pos_prob_above)
-                        else:
-                            rf_probs.append(pos_prob_below)
-                    if rf_probs:
-                        rf_prob = float(np.mean(rf_probs))
-                # Average logistic and random forest probabilities
-                if rf_prob is not None and ml_prob is not None:
-                    ml_prob = float((ml_prob + rf_prob) / 2.0)
-            except Exception:
-                pass
     except Exception:
         ml_prob = None
 
@@ -1446,23 +1243,56 @@ def analyze_ticker(
             "Buy guard failed: need RelStr>0, healthy SPY regime, and either MACD>Signal or (breakout/near-high/high-volume)"
         )
 
-    # Sell guard: prevent premature exit unless negative conditions are met
+    # -----------------------------------------------------------------
+    # Sell guard evaluation
+    # Determine if conditions justify exiting a position when the raw score triggers
+    # a SELL.  We check for negative relative strength, negative momentum,
+    # proximity to the recent low, and a volume-driven down move.  A weak
+    # market regime (SPY) is also required when market_guard is enabled.  These
+    # values are exposed in metrics for transparency.
+    sell_rel = None
+    macd_neg = None
+    near_low_flag = None
+    vol_down = None
+    sell_guard_ok = None
+    try:
+        # negative relative strength vs SPY
+        sell_rel = bool(rel20d_pp is not None and rel20d_pp < 0)
+        # negative momentum: MACD below signal OR histogram negative
+        macd_neg = bool(latest.get("MACD", np.nan) < latest.get("MACD_signal", np.nan) or latest.get("MACD_hist", 0) < 0)
+        # close within 1% of 20-day low
+        near_low_flag = False
+        if latest.get("Low20", np.nan) == latest.get("Low20", np.nan):
+            try:
+                near_low_flag = bool(latest["Close"] <= latest["Low20"] * 1.01)
+            except Exception:
+                near_low_flag = False
+        # high volume on downtrend: volume surge >= dynamic threshold AND price below SMA50
+        vol_down = False
+        try:
+            # ensure SMA50 is valid
+            if not np.isnan(latest.get("SMA50", np.nan)):
+                vol_down = bool((vol_surge >= vol_threshold_dynamic) and (latest["Close"] < latest["SMA50"]))
+        except Exception:
+            vol_down = False
+        # combine conditions: require negative relative strength and at least one
+        # of (negative momentum, near-low, volume down).  In a healthy market
+        # regime we avoid selling unless the regime itself is weak.
+        sell_guard_ok = bool(sell_rel and (macd_neg or near_low_flag or vol_down) and ((not spy_regime_ok) if market_guard else True))
+    except Exception:
+        sell_guard_ok = None
+
+    # Enforce sell guard: convert a SELL into HOLD when conditions are not met
     if signal == "SELL" and not relax_guards:
         try:
-            # negative relative strength vs SPY
-            sell_rel = (rel20d_pp is not None and rel20d_pp < 0)
-            # negative momentum (MACD below signal or histogram negative)
-            macd_neg = bool(latest["MACD"] < latest["MACD_signal"] or latest["MACD_hist"] < 0)
-            # price near recent low (within 1%)
-            near_low_flag = (latest["Close"] <= latest["Low20"] * 1.01) if not np.isnan(latest.get("Low20", np.nan)) else False
-            # volume surge on down move (volume >= threshold and price below SMA50)
-            vol_down = (vol_surge >= vol_threshold_dynamic and latest["Close"] < latest["SMA50"]) if latest.get("SMA50") == latest.get("SMA50") else False
-            sell_guard_ok = sell_rel and (macd_neg or near_low_flag or vol_down) and (not spy_regime_ok if market_guard else True)
             if not sell_guard_ok:
                 signal = "HOLD"
-                reasons.append("Sell guard failed: need RelStr<0 and either MACD<Signal or (near-low/high-volume downtrend)")
+                reasons.append(
+                    "Sell guard failed: need RelStr<0 and either MACD<Signal or (near-low/high-volume downtrend)"
+                )
         except Exception:
-            pass
+            # If any error evaluating sell guard, default to holding
+            signal = "HOLD"
 
     ibkr_delta = None
     if optional_ibkr_price is not None and optional_ibkr_price > 0 and price:
@@ -1508,9 +1338,6 @@ def analyze_ticker(
             "backtest10_avg_return_pct": round(backtest_multi.get(10, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(10, {}).get("avg_ret") is not None else None,
             "backtest20_win_rate_pct": round(backtest_multi.get(20, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(20, {}).get("win_rate") is not None else None,
             "backtest20_avg_return_pct": round(backtest_multi.get(20, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(20, {}).get("avg_ret") is not None else None,
-            # 40‑day backtest metrics
-            "backtest40_win_rate_pct": round(backtest_multi.get(40, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(40, {}).get("win_rate") is not None else None,
-            "backtest40_avg_return_pct": round(backtest_multi.get(40, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(40, {}).get("avg_ret") is not None else None,
             # Extended fundamental metrics
             "gross_margin_pct": round(float(gross_margin) * 100, 2) if isinstance(gross_margin, (int, float)) else None,
             "operating_margin_pct": round(float(op_margin) * 100, 2) if isinstance(op_margin, (int, float)) else None,
@@ -1522,15 +1349,13 @@ def analyze_ticker(
             # Additional fundamental metrics
             "eps_growth_pct": round(float(eps_growth) * 100, 2) if isinstance(eps_growth, (int, float)) else None,
             "debt_to_equity": round(float(debt_to_equity), 2) if isinstance(debt_to_equity, (int, float)) else None,
+            # Extended earnings/cash metrics
             "trailing_eps": round(float(trailing_eps), 2) if trailing_eps is not None else None,
             "forward_eps": round(float(forward_eps), 2) if forward_eps is not None else None,
             "peg_ratio": round(float(peg_ratio), 2) if peg_ratio is not None else None,
             "cf_per_share": round(float(cf_per_share), 2) if cf_per_share is not None else None,
             # Sector-relative strength
             "relSector20d_pp": round(float(rel_sector_pp), 2) if rel_sector_pp is not None else None,
-            # Macro indicators
-            "macro_yield_change_pct": round(float(macro_yield_change) * 100, 2) if macro_yield_change is not None else None,
-            "macro_cyc_ratio_pp": round(float(macro_cyc_ratio) * 100, 2) if macro_cyc_ratio is not None else None,
             "sl": sl_level, "tp": tp_level,
             "sl_mult": sl_mult, "tp_mult": tp_mult,
             "buy_guard_ok": bool(guard_ok),
@@ -1540,6 +1365,15 @@ def analyze_ticker(
                       # simple volume surge flag indicates volume >= 1.3x average
                       "vol_ok_simple": bool(vol_ok_simple),
                       "spy_regime_ok": bool(spy_regime_ok)},
+            # Sell guard status and flags for transparency
+            "sell_guard_ok": bool(sell_guard_ok) if sell_guard_ok is not None else None,
+            "sell_flags": {
+                "sell_rel": bool(sell_rel) if sell_rel is not None else None,
+                "macd_neg": bool(macd_neg) if macd_neg is not None else None,
+                "near_low": bool(near_low_flag) if near_low_flag is not None else None,
+                "vol_down": bool(vol_down) if vol_down is not None else None,
+                "spy_regime_weak": bool(not spy_regime_ok) if spy_regime_ok is not None else None,
+            },
         # ML meta‑signal probability expressed as a percentage.  None if ML model not run.
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
         # Standard deviation of the ML probability across CV folds (percentage points)
