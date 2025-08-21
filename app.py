@@ -507,6 +507,18 @@ def analyze_ticker(
         eps_growth = fundamentals.get("earningsGrowth")
         # some tickers provide 'debtToEquity' as ratio (e.g. 1.5); fallback to 0 if not available
         debt_to_equity = fundamentals.get("debtToEquity") or fundamentals.get("debtEquity")
+        # extended metrics: EPS values, PEG ratio and cash flow per share.  These help refine valuation.
+        trailing_eps = fundamentals.get("trailingEps")
+        forward_eps = fundamentals.get("forwardEps")
+        peg_ratio = fundamentals.get("pegRatio")
+        shares_out = fundamentals.get("sharesOutstanding")
+        cf_per_share = None
+        try:
+            if free_cash_flow is not None and shares_out:
+                # Protect against division by zero
+                cf_per_share = float(free_cash_flow) / float(shares_out) if float(shares_out) != 0 else None
+        except Exception:
+            cf_per_share = None
     except Exception:
         gross_margin = op_margin = ebitda_margin = None
         free_cash_flow = total_revenue = None
@@ -515,6 +527,11 @@ def analyze_ticker(
         revenue_growth = None
         eps_growth = None
         debt_to_equity = None
+        trailing_eps = None
+        forward_eps = None
+        peg_ratio = None
+        shares_out = None
+        cf_per_share = None
 
     # Compute FCF margin where FCF and revenue are available
     fcf_margin = None
@@ -653,6 +670,50 @@ def analyze_ticker(
         else:
             score -= 0.2
             reasons.append(f"High debt/equity {de:.2f}")
+
+    # PEG ratio scoring
+    # PEG (Price/Earnings to Growth) ratio <1 often indicates growth at a reasonable price.
+    if peg_ratio is not None and isinstance(peg_ratio, (int, float)) and peg_ratio > 0:
+        pr = float(peg_ratio)
+        if pr < 1:
+            score += 0.3
+            reasons.append(f"PEG <1 ({pr:.2f}) — undervalued growth")
+        elif pr < 2:
+            score += 0.1
+            reasons.append(f"PEG moderate {pr:.2f}")
+        elif pr > 4:
+            score -= 0.3
+            reasons.append(f"PEG very high {pr:.2f}")
+        else:
+            score -= 0.15
+            reasons.append(f"PEG elevated {pr:.2f}")
+
+    # Trailing EPS / earnings yield scoring
+    if trailing_eps is not None and price not in [None, np.nan] and price is not None and price != 0:
+        try:
+            eyield = float(trailing_eps) / float(price)
+            # Earnings yield is EPS divided by price; >5% favourable, negative unfavourable
+            if eyield > 0.05:
+                score += 0.2
+                reasons.append(f"Earnings yield {eyield*100:.1f}% (strong)")
+            elif eyield < 0:
+                score -= 0.3
+                reasons.append("Negative earnings")
+        except Exception:
+            pass
+
+    # Cash flow yield scoring (FCF per share / price)
+    if cf_per_share is not None and price not in [None, np.nan] and price is not None and price != 0:
+        try:
+            cfy = float(cf_per_share) / float(price)
+            if cfy > 0.1:
+                score += 0.3
+                reasons.append(f"High cash flow yield {cfy*100:.1f}%")
+            elif cfy < 0.02:
+                score -= 0.2
+                reasons.append(f"Low cash flow yield {cfy*100:.1f}%")
+        except Exception:
+            pass
     # ---------------------------------------------------------------------
 
     # Trend
@@ -1001,6 +1062,19 @@ def analyze_ticker(
         fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
         fm_eps_growth_f = float(eps_growth) if isinstance(eps_growth, (int, float)) else 0.0
         fm_de_ratio_f = float(debt_to_equity) if isinstance(debt_to_equity, (int, float)) else 0.0
+        # Additional fundamental inputs for ML: PEG ratio and cash flow yield
+        fm_peg_ratio_f = 0.0
+        try:
+            if peg_ratio not in [None, np.nan] and peg_ratio is not None:
+                fm_peg_ratio_f = float(peg_ratio)
+        except Exception:
+            fm_peg_ratio_f = 0.0
+        fm_cf_yield_f = 0.0
+        try:
+            if cf_per_share not in [None, np.nan] and price not in [None, np.nan] and price is not None and price != 0:
+                fm_cf_yield_f = float(cf_per_share) / float(price)
+        except Exception:
+            fm_cf_yield_f = 0.0
         for idx in range(20, len(df) - hold_ml):
             # base values
             close_val = close_series.iloc[idx]
@@ -1062,6 +1136,8 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
+                fm_peg_ratio_f,
+                fm_cf_yield_f,
             ]
             # Skip vector if any value is NaN or infinite
             if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
@@ -1134,6 +1210,8 @@ def analyze_ticker(
                 fm_leverage_f,
                 fm_eps_growth_f,
                 fm_de_ratio_f,
+                fm_peg_ratio_f,
+                fm_cf_yield_f,
             ]
             # Standardize last feature vector using training means/stds
             X_last_std = (np.array(f_last) - mean_vec) / std_vec
@@ -1639,7 +1717,6 @@ for r in results:
         "Leverage (ND/EBITDA)": m.get("net_debt_ebitda"),
             "ML Prob (%)": m.get("ml_prob_pct"),
         "BuyGuard": "OK" if m.get("buy_guard_ok") else "Fail",
-        "SellGuard": ("OK" if m.get("sell_guard_ok") else ("Fail" if m.get("sell_guard_ok") is not None else None)),
         "SL": m.get("sl"),
         "TP": m.get("tp"),
         "Days→Earn": m.get("days_to_earnings"),
@@ -1713,67 +1790,123 @@ for r in results:
     if r.get("error"):
         st.warning(r.get("error")); continue
     m = r.get("metrics", {})
-    left, right = st.columns([2, 1])
-    with left:
+    # Show chart and metrics in a stacked layout instead of side‑by‑side.  The chart occupies the full width
+    # of the container, and key metrics are displayed underneath in three columns.  This reduces vertical
+    # scrolling by utilizing the whitespace below the chart.
+    with st.container():
+        # Chart section
         fig = build_chart(r["df"], title=f"{t} (last {CHART_WINDOW_DAYS}d)", sl=m.get("sl"), tp=m.get("tp"))
         st.plotly_chart(fig, use_container_width=True)
-    with right:
+
+        # Metrics section: distribute values across 3 columns
         st.markdown("### Key metrics")
-        st.metric(
+        col1, col2, col3 = st.columns(3)
+
+        # Price displayed as a metric with delta in the first column
+        col1.metric(
             "Price",
             f"{m.get('price')}",
             delta=f"{m.get('change_pct')}%" if m.get('change_pct') is not None else None,
         )
-        # Display a concise selection of technical indicators and computed values
-        st.text(f"RSI14: {m.get('rsi14')}")
-        st.text(f"ATR%: {m.get('atr_pct')}")
-        st.text(f"ATR: {m.get('atr14')}")
-        st.text(f"Vol xAvg20: {m.get('vol_surge')}")
-        st.text(f"Ext% vs 50d: {m.get('ext_pct')}")
-        st.text(f"BB pos (0-1): {m.get('bb_pos')}")
-        # Show the width of the Bollinger channel as a percentage of the midline.  Lower values
-        # indicate compressed volatility, potentially preceding a breakout.
-        st.text(f"BB width (%): {m.get('bb_width_pct')}")
-        st.text(f"RelStr 20d vs SPY (pp): {m.get('rel20d_pp')}")
-        st.text(f"SL (x{m.get('sl_mult')} ATR): {m.get('sl')}")
-        st.text(f"TP (x{m.get('tp_mult')} ATR): {m.get('tp')}")
-        st.text(f"Days→Earnings: {m.get('days_to_earnings')}")
+
+        # Gather a list of (label, value) tuples for remaining metrics.  We include only those
+        # metrics that are not None.  Later we will distribute them evenly across the three columns.
+        metrics_list = []
+        # Technical and price-related indicators
+        metrics_list.append(("RSI14", m.get("rsi14")))
+        metrics_list.append(("ATR%", m.get("atr_pct")))
+        metrics_list.append(("ATR", m.get("atr14")))
+        metrics_list.append(("Vol xAvg20", m.get("vol_surge")))
+        metrics_list.append(("Ext% vs 50d", m.get("ext_pct")))
+        metrics_list.append(("BB pos (0-1)", m.get("bb_pos")))
+        metrics_list.append(("BB width (%)", m.get("bb_width_pct")))
+        metrics_list.append(("RelStr 20d vs SPY (pp)", m.get("rel20d_pp")))
+        metrics_list.append((f"SL (x{m.get('sl_mult')} ATR)", m.get("sl")))
+        metrics_list.append((f"TP (x{m.get('tp_mult')} ATR)", m.get("tp")))
+        metrics_list.append(("Days→Earnings", m.get("days_to_earnings")))
         if m.get("ibkr_delta_pct") is not None:
-            st.text(f"IBKR Δ%: {m.get('ibkr_delta_pct')}%")
+            metrics_list.append(("IBKR Δ%", f"{m.get('ibkr_delta_pct')}%"))
 
-        # Display select fundamental metrics and backtest summary
+        # Fundamental metrics
         if m.get("pe_ratio") is not None:
-            st.text(f"P/E ratio: {m.get('pe_ratio')}")
+            metrics_list.append(("P/E ratio", m.get("pe_ratio")))
         if m.get("profit_margin_pct") is not None:
-            st.text(f"Profit margin: {m.get('profit_margin_pct')}%")
+            metrics_list.append(("Profit margin", f"{m.get('profit_margin_pct')}%"))
         if m.get("roe_pct") is not None:
-            st.text(f"ROE: {m.get('roe_pct')}%")
-        if m.get("backtest_win_rate_pct") is not None:
-            st.text(f"BT win rate: {m.get('backtest_win_rate_pct')}%")
-        if m.get("backtest_avg_return_pct") is not None:
-            st.text(f"BT avg return: {m.get('backtest_avg_return_pct')}%")
-        if m.get("backtest_signals") is not None and int(m.get("backtest_signals")) > 0:
-            st.text(f"BT signals: {m.get('backtest_signals')}")
+            metrics_list.append(("ROE", f"{m.get('roe_pct')}%"))
+        # Earnings and cash flow related metrics
+        if m.get("trailing_eps") is not None:
+            metrics_list.append(("Trailing EPS", m.get("trailing_eps")))
+        if m.get("forward_eps") is not None:
+            metrics_list.append(("Forward EPS", m.get("forward_eps")))
+        if m.get("peg_ratio") is not None:
+            metrics_list.append(("PEG ratio", m.get("peg_ratio")))
+        if m.get("cf_per_share") is not None:
+            metrics_list.append(("CF per share", m.get("cf_per_share")))
+        if m.get("eps_growth_pct") is not None:
+            metrics_list.append(("EPS growth", f"{m.get('eps_growth_pct')}%"))
+        if m.get("de_ratio") is not None:
+            metrics_list.append(("Debt/Equity", m.get("de_ratio")))
 
-        # Additional fundamental and sector metrics
+        # Sector and other margin metrics
         if m.get("relSector20d_pp") is not None:
-            st.text(f"RelStr 20d vs sector (pp): {m.get('relSector20d_pp')}")
+            metrics_list.append(("RelStr 20d vs sector (pp)", m.get("relSector20d_pp")))
         if m.get("gross_margin_pct") is not None:
-            st.text(f"Gross margin: {m.get('gross_margin_pct')}%")
+            metrics_list.append(("Gross margin", f"{m.get('gross_margin_pct')}%"))
         if m.get("operating_margin_pct") is not None:
-            st.text(f"Operating margin: {m.get('operating_margin_pct')}%")
+            metrics_list.append(("Operating margin", f"{m.get('operating_margin_pct')}%"))
         if m.get("ebitda_margin_pct") is not None:
-            st.text(f"EBITDA margin: {m.get('ebitda_margin_pct')}%")
+            metrics_list.append(("EBITDA margin", f"{m.get('ebitda_margin_pct')}%"))
         if m.get("fcf_margin_pct") is not None:
-            st.text(f"FCF margin: {m.get('fcf_margin_pct')}%")
+            metrics_list.append(("FCF margin", f"{m.get('fcf_margin_pct')}%"))
         if m.get("revenue_growth_pct") is not None:
-            st.text(f"Revenue growth: {m.get('revenue_growth_pct')}%")
+            metrics_list.append(("Revenue growth", f"{m.get('revenue_growth_pct')}%"))
         if m.get("net_debt_ebitda") is not None:
-            st.text(f"Net debt/EBITDA: {m.get('net_debt_ebitda')}")
+            metrics_list.append(("Net debt/EBITDA", m.get("net_debt_ebitda")))
 
-        # Display ML probability when available
+        # Backtest metrics
+        if m.get("backtest_win_rate_pct") is not None:
+            metrics_list.append(("BT win rate", f"{m.get('backtest_win_rate_pct')}%"))
+        if m.get("backtest_avg_return_pct") is not None:
+            metrics_list.append(("BT avg return", f"{m.get('backtest_avg_return_pct')}%"))
+        if m.get("backtest_signals") is not None and int(m.get("backtest_signals")) > 0:
+            metrics_list.append(("BT signals", m.get("backtest_signals")))
+        # Additional horizons if available
+        if m.get("backtest5_win_rate_pct") is not None:
+            metrics_list.append(("BT5 win rate", f"{m.get('backtest5_win_rate_pct')}%"))
+        if m.get("backtest5_avg_return_pct") is not None:
+            metrics_list.append(("BT5 avg return", f"{m.get('backtest5_avg_return_pct')}%"))
+        if m.get("backtest10_win_rate_pct") is not None:
+            metrics_list.append(("BT10 win rate", f"{m.get('backtest10_win_rate_pct')}%"))
+        if m.get("backtest10_avg_return_pct") is not None:
+            metrics_list.append(("BT10 avg return", f"{m.get('backtest10_avg_return_pct')}%"))
+        if m.get("backtest20_win_rate_pct") is not None:
+            metrics_list.append(("BT20 win rate", f"{m.get('backtest20_win_rate_pct')}%"))
+        if m.get("backtest20_avg_return_pct") is not None:
+            metrics_list.append(("BT20 avg return", f"{m.get('backtest20_avg_return_pct')}%"))
+        if m.get("backtest40_win_rate_pct") is not None:
+            metrics_list.append(("BT40 win rate", f"{m.get('backtest40_win_rate_pct')}%"))
+        if m.get("backtest40_avg_return_pct") is not None:
+            metrics_list.append(("BT40 avg return", f"{m.get('backtest40_avg_return_pct')}%"))
+
+        # ML and macro metrics
         if m.get("ml_prob_pct") is not None:
-            st.text(f"ML prob: {m.get('ml_prob_pct'):.1f}%")
+            metrics_list.append(("ML prob", f"{m.get('ml_prob_pct'):.1f}%"))
+        if m.get("macro_yield_change") is not None:
+            metrics_list.append(("10y yield Δ (20d)", f"{m.get('macro_yield_change'):.2f} bp"))
+        if m.get("macro_cyc_ratio") is not None:
+            metrics_list.append(("XLY/XLP ratio", f"{m.get('macro_cyc_ratio'):.2f}"))
+
+        # Distribute metrics across columns evenly
+        cols = [col1, col2, col3]
+        idx = 0
+        for label, value in metrics_list:
+            if value is None:
+                continue
+            # Choose column based on current index and rotate through cols
+            c = cols[idx % 3]
+            c.text(f"{label}: {value}")
+            idx += 1
 
     # --------- FIXED BLOCK (correct indentation + safe formatting) ----------
     with st.expander("📋 IBKR order (copy)"):
@@ -1844,16 +1977,6 @@ Approx. R:R: {rr_text}
         # Show a combined status for breakout/near‑high or a simple volume surge (vol>=1.3×)
         st.write(f"Breakout / NearHigh / VolOK: {b(flags.get('breakout_vol_ok') or flags.get('near_high') or flags.get('vol_ok_simple'))} (vol xAvg20: {m.get('vol_surge')})")
         st.write(f"SPY regime OK: {b(flags.get('spy_regime_ok'))}")
-
-    # Display SellGuard checks in a similar manner
-    with st.expander("🧯 SellGuard checks"):
-        sflags = m.get("sell_flags", {})
-        def b2(v): return "✅" if v else "❌"
-        st.write(f"RelStr20d<0: {b2(sflags.get('sell_rel'))} (val: {m.get('rel20d_pp')})")
-        st.write(f"MACD<Signal or Hist<0: {b2(sflags.get('macd_neg'))}")
-        st.write(f"Near 20d Low: {b2(sflags.get('near_low'))}")
-        st.write(f"High Vol Down: {b2(sflags.get('vol_down'))} (vol xAvg20: {m.get('vol_surge')})")
-        st.write(f"SPY regime weak: {b2(sflags.get('spy_regime_weak'))}")
 
     with st.expander("🤖 Why this signal?"):
         for reason in r.get("explanations", []):
