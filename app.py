@@ -40,7 +40,8 @@ sb: Client | None = create_client(SUPABASE_URL, SUPABASE_ANON_KEY) if (SUPABASE_
 
 # ---------------- Config ----------------
 APP_TITLE = "📈 Watchlist Swing-Assistant"
-DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "META"]
+# Extend the default watchlist with major ETFs for diversification across asset classes.
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "SPY", "QQQ", "IWM", "TLT"]
 DEFAULT_PROFILE = "Balanced"
 CACHE_TTL_SECONDS = 60 * 15
 MAX_LOOKBACK_DAYS = 240
@@ -490,6 +491,7 @@ def analyze_ticker(
     # financial health and capital structure.  Where available, apply
     # heuristic scoring and capture the values for display.
     try:
+        # core extended metrics from yfinance
         gross_margin = fundamentals.get("grossMargins")
         op_margin = fundamentals.get("operatingMargins")
         ebitda_margin = fundamentals.get("ebitdaMargins")
@@ -501,12 +503,18 @@ def analyze_ticker(
         cash_balance = fundamentals.get("cash") or fundamentals.get("totalCash")
         ebitda_val = fundamentals.get("ebitda")
         revenue_growth = fundamentals.get("revenueGrowth")
+        # additional metrics: earnings growth and debt to equity ratio
+        eps_growth = fundamentals.get("earningsGrowth")
+        # some tickers provide 'debtToEquity' as ratio (e.g. 1.5); fallback to 0 if not available
+        debt_to_equity = fundamentals.get("debtToEquity") or fundamentals.get("debtEquity")
     except Exception:
         gross_margin = op_margin = ebitda_margin = None
         free_cash_flow = total_revenue = None
         operating_cash_flow = capex = None
         total_debt = cash_balance = ebitda_val = None
         revenue_growth = None
+        eps_growth = None
+        debt_to_equity = None
 
     # Compute FCF margin where FCF and revenue are available
     fcf_margin = None
@@ -605,6 +613,46 @@ def analyze_ticker(
         elif rg < 0:
             score -= 0.2
             reasons.append(f"Negative revenue growth {rg*100:.1f}%")
+
+    # EPS growth scoring
+    # Earnings growth indicates acceleration or deceleration in profitability relative to last period.
+    # High positive values signify strong earnings momentum; mild negatives penalize the score.
+    if isinstance(eps_growth, (int, float)):
+        eg = float(eps_growth)
+        # eps_growth in yfinance is typically year-over-year growth (e.g. 0.25 = 25%).
+        if eg > 0.2:
+            score += 0.25
+            reasons.append(f"EPS growth {eg*100:.1f}% (very strong)")
+        elif eg > 0.1:
+            score += 0.15
+            reasons.append(f"EPS growth {eg*100:.1f}% (solid)")
+        elif eg > 0:
+            score += 0.05
+            reasons.append(f"EPS growth {eg*100:.1f}% (mild)")
+        elif eg < -0.1:
+            score -= 0.25
+            reasons.append(f"EPS decline {abs(eg*100):.1f}% (weak)")
+        else:
+            score -= 0.1
+            reasons.append(f"EPS growth {eg*100:.1f}% (flat)")
+
+    # Debt to equity scoring
+    # A high debt-to-equity ratio indicates heavy leverage and higher financial risk.
+    # Lower values (<1) imply balanced capital structure, while very high ratios (>3) penalize heavily.
+    if isinstance(debt_to_equity, (int, float)):
+        de = float(debt_to_equity)
+        if de < 1:
+            score += 0.25
+            reasons.append(f"Low debt/equity {de:.2f}")
+        elif de < 2:
+            score += 0.1
+            reasons.append(f"Moderate debt/equity {de:.2f}")
+        elif de > 4:
+            score -= 0.4
+            reasons.append(f"Very high debt/equity {de:.2f}")
+        else:
+            score -= 0.2
+            reasons.append(f"High debt/equity {de:.2f}")
     # ---------------------------------------------------------------------
 
     # Trend
@@ -813,64 +861,103 @@ def analyze_ticker(
         bb_width_ratio = None
 
     # ---------------------------------------------------------------------
-    # Simple historical backtesting
-    # To gauge how the strategy would have performed recently, run a simplified
-    # backtest over the last ~120 days.  A buy signal is generated when
-    # price is above both the 50d and 200d SMAs, the 50d SMA is above the
-    # 200d SMA (bullish structure), MACD line exceeds its signal, and RSI
-    # remains below the configured upper bound.  Returns are measured after
-    # a fixed holding period (10 days).  We compute the win rate and
-    # average return of these trades and apply modest adjustments to the
-    # overall score.  These metrics are stored in the result for display.
-    backtest_win = None
-    backtest_avg = None
-    backtest_count = 0
+    # Enhanced historical backtesting
+    # To provide a more realistic assessment of the strategy, simulate trades
+    # across multiple holding periods with transaction costs and a simple
+    # trailing stop.  We test horizons of 5, 10 and 20 days.  At each
+    # potential entry the strategy must meet basic bullish conditions (price
+    # above 50d and 200d SMA, bullish cross, positive MACD and acceptable RSI).
+    # Each simulated trade exits either at the end of the horizon or when a
+    # trailing stop (based on SL multiplier) is hit.  A per‑trade cost of
+    # ~0.2% (0.002) is deducted to account for commissions/slippage.  The
+    # win rate and average net return for each horizon are computed and
+    # aggregated to adjust the overall score.  Results are captured in the
+    # metrics for display.
+    backtest_multi: Dict[int, Dict[str, float | int]] = {}
+    backtest_signals_total = 0
     try:
-        hold_days = 10
-        back_returns: List[float] = []
-        # Limit lookback to the most recent 120 days to emphasize recent market
-        # conditions.  Skip earlier rows when the dataset is longer.
+        hold_periods = [5, 10, 20]
         lookback_window = 120
-        for idx in range(max(0, len(df) - lookback_window), len(df) - hold_days):
-            row = df.iloc[idx]
-            # Ensure SMA columns are present and not NaN
-            if (not np.isnan(row.get("SMA50", np.nan)) and
-                not np.isnan(row.get("SMA200", np.nan)) and
-                row["Close"] > row["SMA50"] and
-                row["Close"] > row["SMA200"] and
-                row["SMA50"] > row["SMA200"] and
-                row["MACD"] > row["MACD_signal"] and
-                row["RSI14"] < cfg.get("rsi_upper", 70)):
-                future_index = idx + hold_days
-                if future_index < len(df):
-                    ret = (df["Close"].iloc[future_index] / row["Close"]) - 1
-                    back_returns.append(float(ret))
-        backtest_count = len(back_returns)
-        if back_returns:
-            backtest_win = float(sum(1 for x in back_returns if x > 0) / len(back_returns))
-            backtest_avg = float(np.mean(back_returns))
+        trade_cost = 0.002  # 0.2% round‑trip cost
+        sl_mult_bt = cfg.get("sl_atr_mult", 1.5)
+        tp_mult_bt = cfg.get("tp_atr_mult", 2.5)
+        for h in hold_periods:
+            returns_h: List[float] = []
+            count_h = 0
+            for idx in range(max(0, len(df) - lookback_window), len(df) - h):
+                row = df.iloc[idx]
+                # Require valid SMAs and technical alignment before entering
+                if (
+                    not np.isnan(row.get("SMA50", np.nan)) and
+                    not np.isnan(row.get("SMA200", np.nan)) and
+                    row["Close"] > row["SMA50"] and
+                    row["Close"] > row["SMA200"] and
+                    row["SMA50"] > row["SMA200"] and
+                    row["MACD"] > row["MACD_signal"] and
+                    row["RSI14"] < cfg.get("rsi_upper", 70)
+                ):
+                    entry_price = float(row["Close"])
+                    # derive ATR for stop calculation; fallback to 0 if missing
+                    atr_entry = float(row.get("ATR14", 0.0)) if row.get("ATR14", np.nan) == row.get("ATR14", np.nan) else 0.0
+                    stop_price = entry_price - sl_mult_bt * atr_entry if atr_entry > 0 else None
+                    target_price = entry_price + tp_mult_bt * atr_entry if atr_entry > 0 else None
+                    exit_price = None
+                    # iterate through holding window to apply trailing stop / target
+                    for j in range(1, h + 1):
+                        if idx + j >= len(df):
+                            break
+                        p_close = float(df["Close"].iloc[idx + j])
+                        p_low = float(df["Low"].iloc[idx + j])
+                        # check trailing stop
+                        if stop_price is not None and p_low <= stop_price:
+                            exit_price = stop_price
+                            break
+                        # optional: take profit if price exceeds target
+                        if target_price is not None and p_close >= target_price:
+                            exit_price = target_price
+                            break
+                    # if no stop or target was hit, sell at end of horizon
+                    if exit_price is None and idx + h < len(df):
+                        exit_price = float(df["Close"].iloc[idx + h])
+                    if exit_price is not None:
+                        ret_h = (exit_price / entry_price) - 1.0 - trade_cost
+                        returns_h.append(ret_h)
+                        count_h += 1
+            win_rate_h = float(sum(1 for x in returns_h if x > 0) / len(returns_h)) if returns_h else None
+            avg_ret_h = float(np.mean(returns_h)) if returns_h else None
+            backtest_multi[h] = {
+                "win_rate": win_rate_h,
+                "avg_ret": avg_ret_h,
+                "count": count_h,
+            }
+            backtest_signals_total += count_h
+        # Aggregate results across horizons for scoring
+        win_rates = [v["win_rate"] for v in backtest_multi.values() if v["win_rate"] is not None]
+        avg_returns = [v["avg_ret"] for v in backtest_multi.values() if v["avg_ret"] is not None]
+        if win_rates and avg_returns:
+            agg_win = float(np.mean(win_rates))
+            agg_ret = float(np.mean(avg_returns))
             reasons.append(
-                f"Backtest win rate {backtest_win*100:.0f}% (avg {backtest_avg*100:.2f}%)"
+                f"Backtest avg win rate {agg_win*100:.0f}% (avg return {agg_ret*100:.2f}%) over {len(win_rates)} horizons"
             )
-            # Score adjustments based on backtest success metrics
-            if backtest_win > 0.6:
+            # Adjust score based on aggregated metrics
+            if agg_win > 0.6:
                 score += 0.5
-            elif backtest_win > 0.5:
+            elif agg_win > 0.5:
                 score += 0.25
-            elif backtest_win < 0.4:
+            elif agg_win < 0.4:
                 score -= 0.5
-            elif backtest_win < 0.5:
+            elif agg_win < 0.5:
                 score -= 0.25
-            if backtest_avg > 0.05:
+            if agg_ret > 0.05:
                 score += 0.5
-            elif backtest_avg > 0.02:
+            elif agg_ret > 0.02:
                 score += 0.25
-            elif backtest_avg < 0:
+            elif agg_ret < 0:
                 score -= 0.25
     except Exception:
-        backtest_win = None
-        backtest_avg = None
-        backtest_count = 0
+        backtest_multi = {}
+        backtest_signals_total = 0
 
     # ---------------------------------------------------------------------
     # Meta‑signal via logistic regression (pure NumPy)
@@ -884,6 +971,7 @@ def analyze_ticker(
     # exists or the classes are imbalanced, the ML probability will remain
     # None and this step will not affect the score.
     ml_prob = None
+    ml_prob_std = None
     try:
         hold_ml = 10
         feat_matrix: List[List[float]] = []
@@ -901,6 +989,18 @@ def analyze_ticker(
         macd_series = df["MACD"].reset_index(drop=True)
         macdsig_series = df["MACD_signal"].reset_index(drop=True)
         machist_series = df["MACD_hist"].reset_index(drop=True)
+        # Precompute fundamental feature constants once for the entire ML section
+        fm_profit = float(profit_margin) if profit_margin not in [None, np.nan] else 0.0
+        fm_pe = float(pe_ratio) if pe_ratio not in [None, np.nan] else 0.0
+        fm_roe = float(roe) if roe not in [None, np.nan] else 0.0
+        fm_gross = float(gross_margin) if isinstance(gross_margin, (int, float)) else 0.0
+        fm_oper_f = float(op_margin) if isinstance(op_margin, (int, float)) else 0.0
+        fm_ebitda_f = float(ebitda_margin) if isinstance(ebitda_margin, (int, float)) else 0.0
+        fm_fcf_f = float(fcf_margin) if fcf_margin not in [None, np.nan] else 0.0
+        fm_revgr_f = float(revenue_growth) if isinstance(revenue_growth, (int, float)) else 0.0
+        fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
+        fm_eps_growth_f = float(eps_growth) if isinstance(eps_growth, (int, float)) else 0.0
+        fm_de_ratio_f = float(debt_to_equity) if isinstance(debt_to_equity, (int, float)) else 0.0
         for idx in range(20, len(df) - hold_ml):
             # base values
             close_val = close_series.iloc[idx]
@@ -937,16 +1037,7 @@ def analyze_ticker(
                 bb_width_f = float((bb_upper_arr.iloc[idx] - bb_lower_arr.iloc[idx]) / bb_mid_arr.iloc[idx])
             else:
                 bb_width_f = 1.0
-            # Fundamental constants (use defaults for missing values)
-            fm_profit = float(profit_margin) if profit_margin not in [None, np.nan] else 0.0
-            fm_pe = float(pe_ratio) if pe_ratio not in [None, np.nan] else 0.0
-            fm_roe = float(roe) if roe not in [None, np.nan] else 0.0
-            fm_gross = float(gross_margin) if isinstance(gross_margin, (int, float)) else 0.0
-            fm_oper_f = float(op_margin) if isinstance(op_margin, (int, float)) else 0.0
-            fm_ebitda_f = float(ebitda_margin) if isinstance(ebitda_margin, (int, float)) else 0.0
-            fm_fcf_f = float(fcf_margin) if fcf_margin not in [None, np.nan] else 0.0
-            fm_revgr_f = float(revenue_growth) if isinstance(revenue_growth, (int, float)) else 0.0
-            fm_leverage_f = float(net_debt_ebitda) if net_debt_ebitda not in [None, np.nan] else 0.0
+            # Fundamental constants are precomputed outside the loop (fm_profit, fm_pe, etc.)
             feature_vec = [
                 sma_ratio,
                 sma200_ratio,
@@ -969,6 +1060,8 @@ def analyze_ticker(
                 fm_fcf_f,
                 fm_revgr_f,
                 fm_leverage_f,
+                fm_eps_growth_f,
+                fm_de_ratio_f,
             ]
             # Skip vector if any value is NaN or infinite
             if any([(isinstance(x, float) and (np.isnan(x) or np.isinf(x))) for x in feature_vec]):
@@ -986,9 +1079,7 @@ def analyze_ticker(
             y_raw = np.array(labels_ml, dtype=float)
             # Standardize features
             X_std, mean_vec, std_vec = _standardize_features(X_raw)
-            # Train logistic regression
-            weights_ml, bias_ml = _train_logistic_numpy(X_std, y_raw, lr=0.05, n_iter=200)
-            # Compute features for current row
+            # Compute features for current row (to be standardized using training means/stds)
             idx_last = len(df) - 1
             close_last = close_series.iloc[idx_last]
             sma50_last = sma50_series.iloc[idx_last]
@@ -1041,12 +1132,38 @@ def analyze_ticker(
                 fm_fcf_f,
                 fm_revgr_f,
                 fm_leverage_f,
+                fm_eps_growth_f,
+                fm_de_ratio_f,
             ]
             # Standardize last feature vector using training means/stds
             X_last_std = (np.array(f_last) - mean_vec) / std_vec
-            # Predict probability
-            ml_prob_val = _predict_logistic_numpy(X_last_std.reshape(1, -1), weights_ml, bias_ml)
-            ml_prob = float(ml_prob_val[0])
+            # Cross‑validated logistic models: split standardized data into k folds and train separate models
+            ml_prob_list: List[float] = []
+            n_samples = X_std.shape[0]
+            kfolds = min(3, n_samples)  # use up to 3 folds
+            if kfolds >= 2:
+                fold_size = n_samples // kfolds
+                for fold_idx in range(kfolds):
+                    start = fold_idx * fold_size
+                    end = start + fold_size if fold_idx < kfolds - 1 else n_samples
+                    X_train = np.concatenate([X_std[:start], X_std[end:]], axis=0)
+                    y_train = np.concatenate([y_raw[:start], y_raw[end:]], axis=0)
+                    # Skip fold if training set does not contain both classes
+                    if len(y_train) == 0 or len(set(y_train)) < 2:
+                        continue
+                    w_cv, b_cv = _train_logistic_numpy(X_train, y_train, lr=0.05, n_iter=200)
+                    p_cv = _predict_logistic_numpy(X_last_std.reshape(1, -1), w_cv, b_cv)[0]
+                    ml_prob_list.append(float(p_cv))
+            # If cross validation produced probabilities, average them; otherwise fallback to single model
+            if ml_prob_list:
+                ml_prob = float(np.mean(ml_prob_list))
+                ml_prob_std = float(np.std(ml_prob_list))
+            else:
+                # Fallback: train on all data
+                weights_ml, bias_ml = _train_logistic_numpy(X_std, y_raw, lr=0.05, n_iter=200)
+                prob_fallback = _predict_logistic_numpy(X_last_std.reshape(1, -1), weights_ml, bias_ml)[0]
+                ml_prob = float(prob_fallback)
+                ml_prob_std = 0.0
     except Exception:
         ml_prob = None
 
@@ -1071,6 +1188,10 @@ def analyze_ticker(
         else:
             score -= 0.5
             reasons.append(f"ML prob {ml_pct:.0f}% (very weak)")
+        # Penalize high variance across cross‑validation folds
+        if ml_prob_std not in [None, np.nan] and ml_prob_std > 0.15:
+            score -= 0.25
+            reasons.append(f"ML variance high ({ml_prob_std*100:.0f}pp std)")
 
     # ATR-based SL/TP
     sl_mult = cfg.get("sl_atr_mult", 1.5)
@@ -1155,10 +1276,17 @@ def analyze_ticker(
             # Profit margin and ROE are expressed as percentages for readability
             "profit_margin_pct": round(profit_margin * 100, 2) if profit_margin is not None else None,
             "roe_pct": round(roe * 100, 2) if roe is not None else None,
-            # Backtest summary
-            "backtest_win_rate_pct": round(backtest_win * 100, 1) if backtest_win is not None else None,
-            "backtest_avg_return_pct": round(backtest_avg * 100, 2) if backtest_avg is not None else None,
-            "backtest_signals": backtest_count,
+            # Backtest summary: aggregated across multiple horizons
+            "backtest_win_rate_pct": round(float(np.mean([v["win_rate"] for v in backtest_multi.values() if v["win_rate"] is not None])) * 100, 1) if backtest_multi else None,
+            "backtest_avg_return_pct": round(float(np.mean([v["avg_ret"] for v in backtest_multi.values() if v["avg_ret"] is not None])) * 100, 2) if backtest_multi else None,
+            "backtest_signals": backtest_signals_total,
+            # Backtest details per horizon
+            "backtest5_win_rate_pct": round(backtest_multi.get(5, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(5, {}).get("win_rate") is not None else None,
+            "backtest5_avg_return_pct": round(backtest_multi.get(5, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(5, {}).get("avg_ret") is not None else None,
+            "backtest10_win_rate_pct": round(backtest_multi.get(10, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(10, {}).get("win_rate") is not None else None,
+            "backtest10_avg_return_pct": round(backtest_multi.get(10, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(10, {}).get("avg_ret") is not None else None,
+            "backtest20_win_rate_pct": round(backtest_multi.get(20, {}).get("win_rate", 0) * 100, 1) if backtest_multi.get(20, {}).get("win_rate") is not None else None,
+            "backtest20_avg_return_pct": round(backtest_multi.get(20, {}).get("avg_ret", 0) * 100, 2) if backtest_multi.get(20, {}).get("avg_ret") is not None else None,
             # Extended fundamental metrics
             "gross_margin_pct": round(float(gross_margin) * 100, 2) if isinstance(gross_margin, (int, float)) else None,
             "operating_margin_pct": round(float(op_margin) * 100, 2) if isinstance(op_margin, (int, float)) else None,
@@ -1167,6 +1295,9 @@ def analyze_ticker(
             "net_debt": round(float(net_debt), 2) if net_debt is not None else None,
             "net_debt_ebitda": round(float(net_debt_ebitda), 2) if net_debt_ebitda is not None else None,
             "revenue_growth_pct": round(float(revenue_growth) * 100, 2) if isinstance(revenue_growth, (int, float)) else None,
+            # Additional fundamental metrics
+            "eps_growth_pct": round(float(eps_growth) * 100, 2) if isinstance(eps_growth, (int, float)) else None,
+            "debt_to_equity": round(float(debt_to_equity), 2) if isinstance(debt_to_equity, (int, float)) else None,
             # Sector-relative strength
             "relSector20d_pp": round(float(rel_sector_pp), 2) if rel_sector_pp is not None else None,
             "sl": sl_level, "tp": tp_level,
@@ -1180,6 +1311,8 @@ def analyze_ticker(
                       "spy_regime_ok": bool(spy_regime_ok)},
         # ML meta‑signal probability expressed as a percentage.  None if ML model not run.
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
+        # Standard deviation of the ML probability across CV folds (percentage points)
+        "ml_prob_std_pct": round(ml_prob_std * 100, 2) if ml_prob_std is not None else None,
         },
         "explanations": reasons,
     })
