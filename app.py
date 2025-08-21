@@ -657,25 +657,21 @@ def analyze_ticker(
     else: score -= 0.75; reasons.append(f"RSI {rsi_val:.1f} weak (<40)")
 
     # Breakout + volume (dynamic volume threshold)
-    # compute volume surge factor; default to 1 when missing (i.e., treat missing as neutral)
     vol_surge = float(latest["VolSurge"]) if latest["VolSurge"] == latest["VolSurge"] else 1.0
-    # Determine whether price is trading near the recent high.  Allow a slightly wider band (within 0.5% of the 20‑day high)
-    near_high = latest["Close"] >= latest["High20"] * 0.995 if not np.isnan(latest["High20"]) else False
-    # Determine a dynamic volume threshold based on the recent distribution of volume surge.  We use a lower percentile
-    # (60th rather than 80th) to avoid the threshold growing too aggressive.  We also enforce a minimum threshold of 1.1.
+    # Determine whether price is trading near the recent high.  We consider "near" to be within ~1% of the 20‑day high
+    near_high = latest["Close"] >= latest["High20"] * 0.99 if not np.isnan(latest["High20"]) else False
+    # Determine a dynamic volume threshold based on the median of the last 20 volume surge values.  This keeps the
+    # threshold closer to typical volumes and clamps it between 1.1 and 1.4 to avoid extremes.
     vol_threshold_dynamic: float = 1.1
     try:
         vol_window = df["VolSurge"].dropna().iloc[-20:]
         if len(vol_window) >= 5:
-            # Use the 60th percentile of the last 20 days to derive the threshold
-            vt = float(vol_window.quantile(0.6))
-            # Ensure the threshold does not fall below 1.1
-            vol_threshold_dynamic = max(1.1, vt)
+            vt = float(vol_window.quantile(0.5))
+            vol_threshold_dynamic = min(max(1.1, vt), 1.4)
     except Exception:
-        # fall back to default
         vol_threshold_dynamic = 1.1
-    # True breakout when price closes above the recent high and volume exceeds dynamic threshold
-    true_breakout = (latest["Close"] > latest["High20"]) and (vol_surge >= vol_threshold_dynamic if not np.isnan(vol_surge) else False)
+    # True breakout when price closes above (or essentially at) the recent high and volume exceeds dynamic threshold
+    true_breakout = (latest["Close"] > latest["High20"] * 0.99) and (vol_surge >= vol_threshold_dynamic if not np.isnan(vol_surge) else False)
     if true_breakout:
         score += 1.5
         reasons.append(f"Breakout with volume (x{vol_surge:.2f}, thr {vol_threshold_dynamic:.2f})")
@@ -1106,11 +1102,21 @@ def analyze_ticker(
     elif score <= sell_th:
         signal = "SELL"
 
-    # Guard conditions rely on dynamic volume threshold and relative strength
+    # Guard conditions rely on momentum (MACD), relative strength and either a breakout/volume condition or proximity to the high.
     rel_ok = (rel20d_pp is not None and rel20d_pp > 0)
-    breakout_vol_ok = (latest["Close"] > latest["High20"] and (float(latest["VolSurge"]) if latest["VolSurge"]==latest["VolSurge"] else 0) >= vol_threshold_dynamic)
-    cond2 = breakout_vol_ok or near_high
-    guard_ok = (macd_ok and cond2 and rel_ok and (spy_regime_ok if market_guard else True))
+    # Redefine breakout volume condition to use the adjusted high tolerance (1% off high) and the dynamic threshold we computed above.
+    breakout_vol_ok = (
+        latest["Close"] > latest["High20"] * 0.99 and
+        (float(latest["VolSurge"]) if latest["VolSurge"] == latest["VolSurge"] else 0) >= vol_threshold_dynamic
+    )
+    # Consider pure volume surges above a simpler threshold (e.g. 1.3× average) as an alternative trigger
+    vol_ok_simple = vol_surge >= 1.3 if vol_surge == vol_surge else False
+    # Condition 2 passes if we have a breakout with volume, if price is near the high, or if volume alone is strong
+    cond2 = breakout_vol_ok or near_high or vol_ok_simple
+    # A buy is considered guarded OK if the stock exhibits positive relative strength and either momentum (MACD>Signal) or
+    # price/volume action consistent with a breakout.  This relaxes the requirement that both momentum and breakout must be true,
+    # enabling high‑volume/near‑high situations to qualify even when the MACD has not yet crossed.
+    guard_ok = (rel_ok and (macd_ok or cond2) and (spy_regime_ok if market_guard else True))
     if signal == "BUY" and not (relax_guards or guard_ok):
         signal = "HOLD"
         reasons.append("Buy guard failed: need MACD>Signal, RelStr>0, (breakout vol≥thr or near-high), and healthy SPY regime")
