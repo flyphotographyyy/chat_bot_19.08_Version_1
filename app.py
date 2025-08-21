@@ -714,6 +714,56 @@ def analyze_ticker(
                 reasons.append(f"Low cash flow yield {cfy*100:.1f}%")
         except Exception:
             pass
+
+    # ---------------------------------------------------------------------
+    # Macro context adjustments
+    # Examine changes in interest rates and risk appetite.  Falling long-term yields (e.g. the
+    # 10-year Treasury) typically support equity valuations, while rising yields can be a headwind.
+    # Compare the consumer discretionary ETF (XLY) to consumer staples (XLP) as a gauge of risk‑on vs
+    # risk‑off sentiment.  Rising XLY/XLP ratios suggest investors favour cyclicals.
+    macro_yield_change = None
+    macro_cyc_ratio = None
+    try:
+        # Download 10-year Treasury yield (^TNX) over ~3 months to compute a 20-day change
+        yield_data = yf.download("^TNX", period="3mo", interval="1d", progress=False)
+        series_y = _pick_series(yield_data, ["Adj Close", "Close"])
+        if series_y is not None and len(series_y) >= 20:
+            macro_yield_change = float(series_y.iloc[-1]) - float(series_y.iloc[-20])
+            # Use basis-point change (0.01 percentage points) for readability
+            if macro_yield_change < 0:
+                score += 0.1
+                reasons.append("10y yield ↓ (rates supportive)")
+            else:
+                score -= 0.1
+                reasons.append("10y yield ↑ (rates headwind)")
+    except Exception:
+        macro_yield_change = None
+    try:
+        # Download cyclical (XLY) and defensive (XLP) ETFs to gauge risk appetite
+        cyc_data = yf.download(["XLY", "XLP"], period="3mo", interval="1d", group_by="ticker", progress=False)
+        # Extract adjusted or closing prices using helper
+        def _get_series(data, ticker):
+            # data is a Panel-like structure returned by yf when passing a list of tickers
+            for col in ["Adj Close", "Close"]:
+                try:
+                    return data[col][ticker].dropna()
+                except Exception:
+                    continue
+            return None
+        xly_ser = _get_series(cyc_data, "XLY")
+        xlp_ser = _get_series(cyc_data, "XLP")
+        if xly_ser is not None and xlp_ser is not None and len(xly_ser) >= 20 and len(xlp_ser) >= 20:
+            ratio_curr = float(xly_ser.iloc[-1]) / float(xlp_ser.iloc[-1])
+            ratio_prev = float(xly_ser.iloc[-20]) / float(xlp_ser.iloc[-20])
+            macro_cyc_ratio = ratio_curr / ratio_prev
+            if macro_cyc_ratio > 1:
+                score += 0.1
+                reasons.append("Macro risk‑on (XLY/XLP rising)")
+            else:
+                score -= 0.1
+                reasons.append("Macro risk‑off (XLY/XLP falling)")
+    except Exception:
+        macro_cyc_ratio = None
     # ---------------------------------------------------------------------
 
     # Trend
@@ -1321,6 +1371,30 @@ def analyze_ticker(
             "Buy guard failed: need RelStr>0, healthy SPY regime, and either MACD>Signal or (breakout/near-high/high-volume)"
         )
 
+    # ---------------- SELL GUARD -----------------
+    # Determine conditions for a sell confirmation.  Require negative relative strength,
+    # and at least one of: negative momentum (MACD below signal and histogram <0), price near 20d low,
+    # or a significant volume surge on decline.  Additionally, a weak SPY regime is needed when market_guard
+    # is enabled.  These checks help avoid premature exits during normal pullbacks.
+    sell_rel = bool(rel20d_pp is not None and rel20d_pp < 0)
+    # Negative momentum: MACD below its signal and histogram negative indicates downside pressure.
+    macd_neg = bool(latest["MACD"] < latest["MACD_signal"] and latest["MACD_hist"] < 0)
+    # Near 20-day low: within 1% of recent low suggests breakdown risk.
+    near_low = bool(latest["Close"] <= latest["Low20"] * 1.01) if not np.isnan(latest["Low20"]) else False
+    # High volume down: use the same dynamic threshold but require volume surge to exceed it.
+    vol_down = bool(vol_surge >= max(1.3, vol_threshold_dynamic))
+    # Determine whether overall conditions warrant a sell guard pass.
+    spy_weak = not spy_regime_ok if market_guard else False
+    sell_cond = macd_neg or near_low or vol_down
+    sell_guard_ok = sell_rel and sell_cond and (spy_weak or not market_guard)
+
+    if signal == "SELL" and not (relax_guards or sell_guard_ok):
+        # downgrade to HOLD if sell guard fails
+        signal = "HOLD"
+        reasons.append(
+            "Sell guard failed: need RelStr<0, weak SPY regime, and at least one of (MACD<Signal, near‑low, high‑volume down)"
+        )
+
     ibkr_delta = None
     if optional_ibkr_price is not None and optional_ibkr_price > 0 and price:
         ibkr_delta = ((optional_ibkr_price / price) - 1) * 100
@@ -1391,6 +1465,17 @@ def analyze_ticker(
         "ml_prob_pct": round(ml_prob * 100, 2) if ml_prob is not None else None,
         # Standard deviation of the ML probability across CV folds (percentage points)
         "ml_prob_std_pct": round(ml_prob_std * 100, 2) if ml_prob_std is not None else None,
+            # Additional valuation metrics
+            "trailing_eps": round(float(trailing_eps), 2) if trailing_eps is not None else None,
+            "forward_eps": round(float(forward_eps), 2) if forward_eps is not None else None,
+            "peg_ratio": round(float(peg_ratio), 2) if peg_ratio is not None else None,
+            "cf_per_share": round(float(cf_per_share), 2) if cf_per_share is not None else None,
+            # Macro metrics
+            "macro_yield_change": round(float(macro_yield_change), 2) if macro_yield_change is not None else None,
+            "macro_cyc_ratio": round(float(macro_cyc_ratio), 2) if macro_cyc_ratio is not None else None,
+            # Sell guard flags and status
+            "sell_guard_ok": bool(sell_guard_ok),
+            "sell_flags": {"rel_neg": bool(sell_rel), "macd_neg": bool(macd_neg), "near_low": bool(near_low), "vol_down": bool(vol_down), "spy_regime_weak": bool(spy_weak)},
         },
         "explanations": reasons,
     })
@@ -1721,6 +1806,7 @@ for r in results:
         "TP": m.get("tp"),
         "Days→Earn": m.get("days_to_earnings"),
         "IBKR Δ%": m.get("ibkr_delta_pct"),
+        "SellGuard": "OK" if m.get("sell_guard_ok") else "Fail",
     })
 
 summary_df = pd.DataFrame(rows)
@@ -1845,8 +1931,8 @@ for r in results:
             metrics_list.append(("CF per share", m.get("cf_per_share")))
         if m.get("eps_growth_pct") is not None:
             metrics_list.append(("EPS growth", f"{m.get('eps_growth_pct')}%"))
-        if m.get("de_ratio") is not None:
-            metrics_list.append(("Debt/Equity", m.get("de_ratio")))
+        if m.get("debt_to_equity") is not None:
+            metrics_list.append(("Debt/Equity", m.get("debt_to_equity")))
 
         # Sector and other margin metrics
         if m.get("relSector20d_pp") is not None:
@@ -1977,6 +2063,16 @@ Approx. R:R: {rr_text}
         # Show a combined status for breakout/near‑high or a simple volume surge (vol>=1.3×)
         st.write(f"Breakout / NearHigh / VolOK: {b(flags.get('breakout_vol_ok') or flags.get('near_high') or flags.get('vol_ok_simple'))} (vol xAvg20: {m.get('vol_surge')})")
         st.write(f"SPY regime OK: {b(flags.get('spy_regime_ok'))}")
+
+    # SellGuard checks display: similar layout to BuyGuard but for exit conditions
+    with st.expander("🛑 SellGuard checks"):
+        sflags = m.get("sell_flags", {})
+        def b_s(v): return "✅" if v else "❌"
+        st.write(f"RelStr20d<0: {b_s(sflags.get('rel_neg'))} (val: {m.get('rel20d_pp')})")
+        st.write(f"MACD<Signal: {b_s(sflags.get('macd_neg'))}")
+        st.write(f"Near 20d low: {b_s(sflags.get('near_low'))}")
+        st.write(f"High volume down: {b_s(sflags.get('vol_down'))} (vol xAvg20: {m.get('vol_surge')})")
+        st.write(f"SPY regime weak: {b_s(sflags.get('spy_regime_weak'))}")
 
     with st.expander("🤖 Why this signal?"):
         for reason in r.get("explanations", []):
