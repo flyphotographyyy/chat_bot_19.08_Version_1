@@ -6,6 +6,10 @@ plotly==6.3.0
 streamlit-autorefresh==1.0.1
 requests==2.32.4
 
+# ML and tree-based models used by the meta-signal logic
+scikit-learn==1.1.3
+xgboost==3.0.2
+
 # за акаунти/база в облака (без платен диск)
 supabase==2.18.1
 realtime>=2.5
