@@ -528,7 +528,7 @@ def trading_console(state: Dict[str, Any]):
         if hist is None or hist.empty or len(hist) < 20:
             st.info("Need at least 20 data points to compute intraday metrics. Enter more prices or refresh.")
             if yf is not None and st.button(f"Seed last 1D (yfinance) – {tkr}", key=f"seed_{tkr}"):
-                ok, msg = seed_last_1d_into_session(tkr)
+                ok, msg = seed_last_session_into_session(tkr, min_points=MIN_INTRADAY_POINTS)
                 (st.success if ok else st.warning)(msg)
                 st.rerun()
             continue
@@ -901,22 +901,58 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low_close  = (df['Low']  - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+MIN_INTRADAY_POINTS = 20
 
-def seed_last_1d_into_session(ticker: str) -> tuple[bool, str]:
+def seed_last_session_into_session(ticker: str, min_points: int = MIN_INTRADAY_POINTS) -> tuple[bool, str]:
     """
-    Зарежда в session_state['console_history'][ticker] последните 1 ден (1m барове)
-    чрез get_price_data() и връща (ok, message).
+    Пълни st.session_state['console_history'][ticker] с последна валидна сесия @ 1m.
+    1) Опитва 1d@1m
+    2) Ако < min_points → 5d@1m и взема последната сесия с >= min_points реда
+       (по America/New_York дата). Ако пак няма → взема опашката от max(min_points, 30) реда.
     """
     try:
         df = get_price_data(ticker, period="1d", interval="1m")
+        if df is None:
+            df = pd.DataFrame()
+
+        if df.empty or len(df) < min_points:
+            df5 = get_price_data(ticker, period="5d", interval="1m")
+            if df5 is None or df5.empty:
+                return False, "No intraday data from yfinance."
+            dfx = df5.reset_index().copy()
+            # уверяваме се, че е datetime
+            if "Datetime" not in dfx.columns:
+                dfx.rename(columns={df5.index.name or "index": "Datetime"}, inplace=True)
+            dfx["Datetime"] = pd.to_datetime(dfx["Datetime"], utc=True, errors="coerce")
+            # групиране по търговска дата в Ню Йорк
+            try:
+                import pytz
+                eastern = pytz.timezone("America/New_York")
+                dfx["session_date"] = dfx["Datetime"].dt.tz_convert(eastern).dt.date
+            except Exception:
+                # ако няма pytz, взимаме просто .date() от UTC
+                dfx["session_date"] = dfx["Datetime"].dt.date
+
+            groups = [g for _, g in dfx.groupby("session_date")]
+            valid = [g for g in groups if len(g) >= min_points]
+            if valid:
+                dfx = valid[-1]
+            else:
+                dfx = dfx.tail(max(min_points, 30))
+
+            df = dfx.set_index("Datetime")[["Open", "High", "Low", "Close", "Volume"]]
+
         if df is None or df.empty:
-            return False, "No 1D@1m data from yfinance."
-        df = df.reset_index()
-        st.session_state.setdefault('console_history', {})
-        st.session_state['console_history'][ticker] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        return True, f"Seeded {len(df)} points for {ticker}."
+            return False, "No intraday data from yfinance."
+
+        dfr = df.reset_index()
+        st.session_state.setdefault("console_history", {})
+        st.session_state["console_history"][ticker] = dfr[["Datetime", "Open", "High", "Low", "Close", "Volume"]].copy()
+        return True, f"Seeded {len(dfr)} bars for {ticker}."
     except Exception as e:
         return False, f"Seed failed for {ticker}: {e}"
+
+
     
 
 # -----------------------------------------------------------------------------
