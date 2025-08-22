@@ -15,3 +15,6 @@ realtime>=2.5
 # за username нормализация (ползва се в app.py)
 python-slugify==8.0.4
 
+setuptools>=70
+wheel>=0.43
+
