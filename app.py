@@ -25,6 +25,631 @@ except Exception:
     yf = None
 
 # -----------------------------------------------------------------------------
+# Trading Console helpers and suggestions
+#
+# To provide ticker suggestions without relying on a network call at runtime,
+# define a small dictionary of common US tickers mapped to their company
+# names.  This acts as a fallback when yfinance's search functionality isn't
+# available.  Users can still manually enter any symbol they wish.  Feel free
+# to extend this list with your preferred tickers.
+TICKER_SUGGESTIONS: Dict[str, str] = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corp.",
+    "NVDA": "NVIDIA Corp.",
+    "AMZN": "Amazon.com Inc.",
+    "GOOGL": "Alphabet Inc. Class A",
+    "GOOG": "Alphabet Inc. Class C",
+    "META": "Meta Platforms Inc.",
+    "TSLA": "Tesla Inc.",
+    "NFLX": "Netflix Inc.",
+    "SPY": "SPDR S&P 500 ETF Trust",
+    "QQQ": "Invesco QQQ Trust",
+    "IWM": "iShares Russell 2000 ETF",
+    "TLT": "iShares 20+ Year Treasury Bond ETF",
+    "XLY": "Consumer Discretionary Select Sector SPDR",
+    "XLP": "Consumer Staples Select Sector SPDR",
+    "USO": "United States Oil Fund LP",
+    "XLK": "Technology Select Sector SPDR",
+    "XLF": "Financial Select Sector SPDR",
+    "XLE": "Energy Select Sector SPDR",
+    "XLI": "Industrial Select Sector SPDR",
+    "XLC": "Communication Services Select Sector SPDR",
+    "XLB": "Materials Select Sector SPDR",
+    "XLV": "Health Care Select Sector SPDR",
+    "XLU": "Utilities Select Sector SPDR",
+    "BTC-USD": "Bitcoin USD",
+    "ETH-USD": "Ethereum USD"
+}
+
+def _search_ticker_local(query: str, max_results: int = 5) -> List[Tuple[str, str]]:
+    """Return a list of (ticker, name) pairs matching a query from the static
+    suggestions list.  Matching is case-insensitive and checks both ticker
+    symbols and company names.
+
+    Parameters
+    ----------
+    query : str
+        Partial ticker or company name to search for.
+    max_results : int
+        Maximum number of results to return.
+
+    Returns
+    -------
+    list of tuple
+        Matching (symbol, name) pairs.
+    """
+    if not query:
+        return []
+    q = query.strip().lower()
+    matches: List[Tuple[str, str]] = []
+    for sym, name in TICKER_SUGGESTIONS.items():
+        if q in sym.lower() or q in name.lower():
+            matches.append((sym, name))
+        if len(matches) >= max_results:
+            break
+    return matches
+
+def _search_ticker_via_yf(query: str, max_results: int = 5) -> List[Tuple[str, str]]:
+    """Attempt to query Yahoo Finance for ticker suggestions using yfinance's
+    Search/Lookup functionality.  If this fails (module not available or
+    network error), falls back to the static list.  This function is kept
+    separate to isolate any network-related errors.
+
+    Returns
+    -------
+    list of tuple
+        Matching (symbol, name) pairs.
+    """
+    # First try using yfinance's search API if available
+    if query is None or not query.strip():
+        return []
+    q = query.strip()
+    if yf is not None:
+        try:
+            # yfinance >=0.2.65 exposes a public function `search` that returns
+            # a dictionary with a 'quotes' key.  Each entry contains symbol and
+            # shortname.  Should this not exist, we catch the error below.
+            if hasattr(yf, "search"):
+                res = yf.search(q)
+                quotes = res.get("quotes", []) if isinstance(res, dict) else res
+                results: List[Tuple[str, str]] = []
+                for item in quotes:
+                    sym = item.get("symbol") or item.get("Symbol")
+                    name = item.get("shortname") or item.get("shortName") or item.get("name")
+                    if sym and name:
+                        results.append((sym.upper(), str(name)))
+                        if len(results) >= max_results:
+                            break
+                if results:
+                    return results
+            # Fallback to Lookup class if available
+            # Note: The Lookup API may return a pandas DataFrame-like object.
+            if hasattr(yf, "lookup"):
+                df = yf.lookup(q)
+                results: List[Tuple[str, str]] = []
+                # df may be a DataFrame or list of dict-like structures
+                try:
+                    # when DataFrame-like, iterate over rows
+                    for _, row in df.head(max_results).iterrows():
+                        sym = row.get("symbol") or row.get("Symbol") or row.get("code")
+                        name = row.get("shortname") or row.get("Shortname") or row.get("name")
+                        if sym and name:
+                            results.append((str(sym).upper(), str(name)))
+                    if results:
+                        return results
+                except Exception:
+                    pass
+        except Exception:
+            # Ignore all exceptions from yfinance search
+            pass
+    # fall back to static search
+    return _search_ticker_local(query, max_results)
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    """Compute exponential moving average with given span on a pandas series."""
+    return series.ewm(span=span, adjust=False).mean()
+
+def compute_intraday_metrics(df: pd.DataFrame, spy_df: pd.DataFrame | None = None) -> Tuple[Dict[str, Any], Dict[str, bool], Dict[str, bool]]:
+    """Compute a set of intraday metrics and guard flags from a history of prices.
+
+    The input DataFrame must contain at least a 'Close' column and should be
+    ordered by ascending timestamp.  Additional columns 'High', 'Low' and
+    'Volume' will enhance the calculations but are optional.  When absent,
+    high/low values are approximated by using the close price and volume-based
+    checks are disabled.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Intraday price history, most recent row last.
+    spy_df : DataFrame, optional
+        SPY intraday history for computing relative strength and market regime.
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary of computed indicators.
+    flags : dict
+        Dictionary of boolean buy-guard related flags.
+    sell_flags : dict
+        Dictionary of boolean sell-guard related flags.
+    """
+    metrics: Dict[str, Any] = {}
+    flags: Dict[str, bool] = {}
+    sell_flags: Dict[str, bool] = {}
+    if df is None or df.empty or 'Close' not in df.columns or len(df) < 20:
+        # Not enough data
+        metrics['error'] = 'Not enough intraday data'
+        return metrics, flags, sell_flags
+    # Ensure we work on a copy to avoid modifying state
+    d = df.copy().reset_index(drop=True)
+    # Use close prices
+    prices = d['Close'].astype(float)
+    # Basic metrics
+    last_price = float(prices.iloc[-1])
+    metrics['price'] = last_price
+    metrics['delta_pct'] = ((last_price - float(prices.iloc[0])) / float(prices.iloc[0])) * 100.0 if len(prices) > 0 else None
+    # Compute simple moving averages
+    sma20 = prices.rolling(window=20).mean()
+    sma50 = prices.rolling(window=50).mean()
+    metrics['sma20'] = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else None
+    metrics['sma50'] = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else None
+    # ATR: approximate using absolute price changes
+    diff = prices.diff().abs()
+    atr14 = diff.rolling(window=14).mean()
+    metrics['atr'] = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else None
+    # RSI calculation (14-period)
+    delta = prices.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / roll_down
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    metrics['rsi'] = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else None
+    # High/Low approximations
+    high20 = float(prices.iloc[-20: ].max())
+    low20 = float(prices.iloc[-20: ].min())
+    metrics['high20'] = high20
+    metrics['low20'] = low20
+    # Breakout range normalized
+    if high20 != low20:
+        metrics['bb_pos'] = (last_price - low20) / (high20 - low20)
+    else:
+        metrics['bb_pos'] = 0.0
+    # MACD and signal line using EMA spans 12/26/9
+    macd_line = ema(prices, 12) - ema(prices, 26)
+    signal_line = ema(macd_line, 9)
+    metrics['macd'] = float(macd_line.iloc[-1])
+    metrics['macd_signal'] = float(signal_line.iloc[-1])
+    # Relative strength vs SPY (20-period percentage performance difference)
+    rel_strength_pp = None
+    spy_regime_ok = True
+    if spy_df is not None and not spy_df.empty and 'Close' in spy_df.columns and len(spy_df) >= len(d):
+        sp = spy_df['Close'].astype(float).reset_index(drop=True)
+        # Align lengths by trimming to same length
+        if len(sp) > len(prices):
+            sp = sp.iloc[-len(prices):].reset_index(drop=True)
+        elif len(prices) > len(sp):
+            prices = prices.iloc[-len(sp):].reset_index(drop=True)
+            d = d.iloc[-len(sp):].reset_index(drop=True)
+        # Compute percentage performance over last 20 periods
+        if len(prices) >= 21 and len(sp) >= 21:
+            perf_t = (prices.iloc[-1] - prices.iloc[-21]) / prices.iloc[-21]
+            perf_spy = (sp.iloc[-1] - sp.iloc[-21]) / sp.iloc[-21]
+            rel_strength_pp = 100.0 * (perf_t - perf_spy)
+    metrics['rel_strength_pp'] = rel_strength_pp
+    # SPY regime: simple check if SPY price above its 50 period SMA and upward sloping
+    if spy_df is not None and not spy_df.empty and 'Close' in spy_df.columns and len(spy_df) >= 50:
+        spy_close = spy_df['Close'].astype(float)
+        spy_sma50 = spy_close.rolling(window=50).mean()
+        spy_sma20 = spy_close.rolling(window=20).mean()
+        # slope positive if current SMA is above previous by a small margin
+        spy_slope = spy_sma50.iloc[-1] - spy_sma50.iloc[-20] if not np.isnan(spy_sma50.iloc[-20]) else 0.0
+        spy_regime_ok = bool((spy_close.iloc[-1] >= spy_sma50.iloc[-1]) and (spy_slope >= 0))
+    metrics['spy_regime_ok'] = spy_regime_ok
+    # Volume surge: only if Volume column exists
+    vol_ok_simple = None
+    vol_surge = None
+    if 'Volume' in d.columns:
+        vol = d['Volume'].astype(float)
+        if len(vol) >= 20:
+            avg20 = vol.iloc[-20:].mean()
+            current_vol = vol.iloc[-1]
+            vol_surge = current_vol / avg20 if avg20 else None
+            # consider vol surge >= 1.3 significant
+            vol_ok_simple = bool(vol_surge is not None and vol_surge >= 1.3)
+    metrics['vol_surge'] = float(vol_surge) if vol_surge is not None else None
+    # Guard flags for buy logic
+    rel_ok = (rel_strength_pp is None) or (rel_strength_pp > 0)
+    macd_ok = metrics['macd'] > metrics['macd_signal']
+    near_high = last_price >= (high20 * 0.995)
+    breakout = last_price > high20
+    breakout_vol_ok = breakout or (vol_ok_simple if vol_ok_simple is not None else False)
+    flags['rel_ok'] = rel_ok
+    flags['macd_ok'] = macd_ok
+    flags['near_high'] = near_high
+    flags['breakout_vol_ok'] = breakout_vol_ok
+    flags['vol_ok_simple'] = bool(vol_ok_simple) if vol_ok_simple is not None else False
+    flags['spy_regime_ok'] = spy_regime_ok
+    # Combined buy guard result
+    flags['buy_guard_ok'] = bool(rel_ok and macd_ok and (breakout_vol_ok or near_high) and spy_regime_ok)
+    # Guard flags for sell logic
+    rel_neg = (rel_strength_pp is not None) and (rel_strength_pp < 0)
+    macd_neg = metrics['macd'] < metrics['macd_signal']
+    near_low = last_price <= (low20 * 1.005)
+    # High volume down: if price decreased and volume surged
+    high_volume_down = False
+    if 'Volume' in d.columns and vol_surge is not None:
+        price_change = prices.iloc[-1] - prices.iloc[-2] if len(prices) >= 2 else 0.0
+        high_volume_down = (price_change < 0) and (vol_surge >= 1.3)
+    sell_flags['rel_neg'] = rel_neg
+    sell_flags['macd_neg'] = macd_neg
+    sell_flags['near_low'] = near_low
+    sell_flags['high_volume_down'] = high_volume_down
+    sell_flags['sl_hit'] = False  # updated externally if needed
+    sell_flags['spy_regime_weak'] = not spy_regime_ok
+    # Combined sell guard
+    sell_flags['sell_guard_ok'] = bool(rel_neg and (macd_neg or near_low or high_volume_down))
+    return metrics, flags, sell_flags
+
+def generate_order_plan(price: float, atr: float, acct_size: float, risk_pct: float, side: str = "BUY") -> Dict[str, Any]:
+    """Generate a simple bracket order plan given entry price, ATR, account size and risk.
+
+    Parameters
+    ----------
+    price : float
+        Entry price for the trade.
+    atr : float
+        Average true range (proxy for volatility).
+    acct_size : float
+        Total account size in USD.
+    risk_pct : float
+        Risk per trade in percent of account size.
+    side : str
+        "BUY" or "SELL".  Determines direction of SL/TP.
+
+    Returns
+    -------
+    dict
+        Contains calculated quantity, stop loss, take profit, risk/share, R:R and a textual description.
+    """
+    if price is None or atr is None or price <= 0 or atr <= 0:
+        return {}
+    sl_mult = 1.5  # risk multiple for stop
+    tp_mult = 2.5  # reward multiple for take profit
+    if side == "BUY":
+        sl = price - sl_mult * atr
+        tp = price + tp_mult * atr
+    else:
+        sl = price + sl_mult * atr
+        tp = price - tp_mult * atr
+    risk_per_share = abs(price - sl)
+    risk_amount = acct_size * risk_pct / 100.0
+    qty = int(max(1, np.floor(risk_amount / risk_per_share))) if risk_per_share > 0 else 0
+    rr = abs(tp - price) / risk_per_share if risk_per_share > 0 else None
+    return {
+        "quantity": qty,
+        "stop": round(sl, 2),
+        "take_profit": round(tp, 2),
+        "risk_per_share": round(risk_per_share, 2),
+        "risk_amount": round(risk_amount, 2),
+        "rr": round(rr, 2) if rr is not None else None
+    }
+
+def intraday_backtest(ticker: str, days: int = 20, interval: str = "1m") -> Dict[str, Any]:
+    """Perform a simple intraday backtest on the given ticker using breakout and
+    pullback strategies with fixed ATR-based SL/TP.  Returns basic statistics.
+
+    Because intraday backtesting can be expensive to compute, we limit the
+    period to a small number of days.  If yfinance is unavailable or data
+    cannot be fetched, returns empty metrics.
+    """
+    if yf is None:
+        return {}
+    try:
+        df = get_price_data(ticker, period=f"{days}d", interval=interval)
+        if df is None or df.empty:
+            return {}
+        df = df.reset_index()
+        closes = df['Close'].astype(float)
+        highs = df['High'].astype(float) if 'High' in df.columns else closes
+        lows = df['Low'].astype(float) if 'Low' in df.columns else closes
+        vols = df['Volume'].astype(float) if 'Volume' in df.columns else None
+        # Precompute ATR using absolute diff
+        diff = closes.diff().abs()
+        atr14 = diff.rolling(window=14).mean()
+        results: List[float] = []
+        for i in range(20, len(df) - 1):
+            price = closes.iloc[i]
+            atr = atr14.iloc[i]
+            if np.isnan(atr) or atr <= 0:
+                continue
+            high20 = float(highs.iloc[i-20:i].max())
+            low20 = float(lows.iloc[i-20:i].min())
+            # breakout setup: price > high20
+            is_breakout = price > high20
+            # pullback: price crosses above SMA20 after being below; approximate using last two values
+            sma20 = closes.rolling(window=20).mean()
+            prev_sma = sma20.iloc[i-1]
+            prev_price = closes.iloc[i-1]
+            is_pullback = (prev_price < prev_sma) and (price > sma20.iloc[i])
+            if is_breakout or is_pullback:
+                entry = price
+                # determine side: always long for simplicity
+                sl = entry - 1.5 * atr
+                tp = entry + 2.5 * atr
+                # simulate forward
+                exit_ret = None
+                for j in range(i + 1, len(df)):
+                    p = closes.iloc[j]
+                    if p >= tp:
+                        exit_ret = (tp - entry) / entry
+                        break
+                    if p <= sl:
+                        exit_ret = (sl - entry) / entry
+                        break
+                if exit_ret is None:
+                    exit_ret = (closes.iloc[-1] - entry) / entry
+                results.append(exit_ret)
+        if not results:
+            return {}
+        win_rate = float(np.mean([1 if r > 0 else 0 for r in results]))
+        avg_return = float(np.mean(results))
+        max_drawdown = float(np.min(results)) if results else None
+        profit_factor = float(abs(np.sum([r for r in results if r > 0])) / abs(np.sum([r for r in results if r < 0])) ) if any(r > 0 for r in results) and any(r < 0 for r in results) else None
+        return {
+            "trades": len(results),
+            "win_rate": round(win_rate * 100.0, 2),
+            "avg_return": round(avg_return * 100.0, 2),
+            "max_drawdown": round(max_drawdown * 100.0, 2) if max_drawdown is not None else None,
+            "profit_factor": round(profit_factor, 2) if profit_factor is not None else None
+        }
+    except Exception:
+        return {}
+
+def trading_console(state: Dict[str, Any]):
+    """Render the Trading Console page.  This interface allows the user to
+    select one or more tickers, input prices manually or fetch them via the
+    yfinance API, compute intraday indicators, evaluate BuyGuard/SellGuard
+    conditions, generate order plans and display simple intraday backtest
+    statistics.  The console maintains per-ticker history in session_state.
+
+    Parameters
+    ----------
+    state : dict
+        Persistent watchlist settings (account size, risk %, etc.) to use for
+        risk calculations.  This function does not modify the watchlist.
+    """
+    st.markdown("## 📈 Trading Console")
+    # Initialize session state containers for console
+    if 'console_tickers' not in st.session_state:
+        st.session_state['console_tickers'] = []
+    if 'console_history' not in st.session_state:
+        st.session_state['console_history'] = {}
+    if 'console_positions' not in st.session_state:
+        st.session_state['console_positions'] = {}
+    if 'console_journal' not in st.session_state:
+        st.session_state['console_journal'] = []
+    # Search and add tickers
+    st.markdown("### 🔍 Add tickers to console")
+    search_query = st.text_input("Search ticker", key="console_search", placeholder="Type ticker or company name")
+    if search_query:
+        suggestions = _search_ticker_via_yf(search_query, max_results=5)
+        if suggestions:
+            sel = st.selectbox("Suggestions", options=[f"{s} – {n}" for s, n in suggestions], key="console_suggestion")
+            if st.button("Add selected"):
+                ticker = sel.split(" – ")[0].strip().upper()
+                if ticker and ticker not in st.session_state['console_tickers']:
+                    st.session_state['console_tickers'].append(ticker)
+                    st.success(f"Added {ticker}")
+        else:
+            st.caption("No suggestions found.")
+    manual = st.text_input("Add ticker manually", key="console_manual", placeholder="e.g. AAPL")
+    if st.button("Add manual ticker"):
+        sym = manual.strip().upper() if manual else ""
+        if sym:
+            if sym not in st.session_state['console_tickers']:
+                st.session_state['console_tickers'].append(sym)
+                st.success(f"Added {sym}")
+            else:
+                st.info(f"{sym} already in console")
+        else:
+            st.warning("Enter a valid symbol")
+    # Remove tickers
+    if st.session_state['console_tickers']:
+        rem = st.multiselect("Remove tickers", options=st.session_state['console_tickers'], key="console_remove")
+        if st.button("Remove selected tickers") and rem:
+            st.session_state['console_tickers'] = [t for t in st.session_state['console_tickers'] if t not in rem]
+            for r in rem:
+                st.session_state['console_history'].pop(r, None)
+                st.session_state['console_positions'].pop(r, None)
+            st.warning(f"Removed {', '.join(rem)}")
+    st.markdown("---")
+    # Mode selection: manual or auto
+    mode = st.radio("Price update mode", ["Manual", "Auto (requires API)"] , key="console_mode")
+    # For manual mode: display inputs for each ticker
+    if not st.session_state['console_tickers']:
+        st.info("Add at least one ticker to begin.")
+        return
+    acct_size = float(state.get("acct_size", 10000.0))
+    risk_pct  = float(state.get("risk_pct", 1.0))
+    # Pre-fetch SPY intraday for relative strength and regime; if fails, it will be None
+    spy_history: pd.DataFrame | None = None
+    if yf is not None and mode == "Auto (requires API)":
+        try:
+            spy_history = get_price_data("SPY", period="5d", interval="1m")
+        except Exception:
+            spy_history = None
+    else:
+        spy_history = None
+    # Price update section
+    if mode == "Manual":
+        st.markdown("### 🕒 Manual price update")
+        # Show inputs for each ticker
+        price_cols = st.columns(min(4, len(st.session_state['console_tickers'])))
+        manual_prices: Dict[str, float | None] = {}
+        for idx, tkr in enumerate(st.session_state['console_tickers']):
+            with price_cols[idx % len(price_cols)]:
+                p = st.text_input(f"{tkr} price", key=f"console_price_{tkr}", placeholder="e.g. 145.23")
+                try:
+                    manual_prices[tkr] = float(p) if p else None
+                except Exception:
+                    manual_prices[tkr] = None
+        if st.button("Update prices"):
+            now = datetime.utcnow()
+            for tkr, p in manual_prices.items():
+                if p is None:
+                    continue
+                hist = st.session_state['console_history'].get(tkr)
+                if hist is None or hist.empty:
+                    hist = pd.DataFrame({
+                        'Datetime': [now],
+                        'Close': [p]
+                    })
+                else:
+                    hist = hist.append({'Datetime': now, 'Close': p}, ignore_index=True)
+                st.session_state['console_history'][tkr] = hist
+            st.success("Prices updated")
+    else:
+        st.markdown("### 🔄 Auto price update")
+        # For each ticker, fetch latest 1m bars from yfinance
+        refresh_btn = st.button("Refresh from API now")
+        if refresh_btn:
+            for tkr in st.session_state['console_tickers']:
+                try:
+                    df = get_price_data(tkr, period="5d", interval="1m")
+                    if df is not None and not df.empty:
+                        df = df.reset_index()
+                        st.session_state['console_history'][tkr] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                except Exception:
+                    st.warning(f"Failed to refresh {tkr}")
+            st.success("Data refreshed from API")
+    st.markdown("---")
+    # Display analysis for each ticker
+    for tkr in st.session_state['console_tickers']:
+        st.markdown(f"### {tkr}")
+        hist = st.session_state['console_history'].get(tkr)
+        if hist is None or hist.empty or len(hist) < 20:
+            st.info("Need at least 20 data points to compute intraday metrics. Enter more prices or refresh.")
+            continue
+        # Fetch SPY history for relative strength if not already loaded
+        spy_df = spy_history
+        if mode == "Manual" and spy_df is None:
+            spy_df = None
+        metrics, flags, sell_flags = compute_intraday_metrics(hist, spy_df)
+        # Show chart
+        # Use plotly if available, else fallback to streamlit line_chart
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist['Datetime'], y=hist['Close'], mode='lines', name='Price'))
+            if metrics.get('sma20'):
+                # Compute SMA20 series for plotting
+                sma20_series = hist['Close'].rolling(window=20).mean()
+                fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma20_series, mode='lines', name='SMA20'))
+            if metrics.get('sma50'):
+                sma50_series = hist['Close'].rolling(window=50).mean()
+                fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma50_series, mode='lines', name='SMA50'))
+            fig.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=20), showlegend=True)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            st.line_chart(hist.set_index('Datetime')['Close'])
+        # Key intraday metrics in columns
+        col_metrics = st.columns(3)
+        with col_metrics[0]:
+            st.metric("Price", f"{metrics.get('price', 'n/a'):.2f}" if isinstance(metrics.get('price'), (int, float)) else "n/a")
+            st.metric("Δ% since first", f"{metrics.get('delta_pct', 0.0):.2f}%" if isinstance(metrics.get('delta_pct'), (int, float)) else "n/a")
+            st.metric("RSI(14)", f"{metrics.get('rsi', 0.0):.2f}" if isinstance(metrics.get('rsi'), (int, float)) else "n/a")
+            st.metric("ATR", f"{metrics.get('atr', 0.0):.2f}" if isinstance(metrics.get('atr'), (int, float)) else "n/a")
+        with col_metrics[1]:
+            st.metric("SMA20", f"{metrics.get('sma20', 0.0):.2f}" if isinstance(metrics.get('sma20'), (int, float)) else "n/a")
+            st.metric("SMA50", f"{metrics.get('sma50', 0.0):.2f}" if isinstance(metrics.get('sma50'), (int, float)) else "n/a")
+            st.metric("BB pos", f"{metrics.get('bb_pos', 0.0)*100:.2f}%" if isinstance(metrics.get('bb_pos'), (int, float)) else "n/a")
+            st.metric("RelStr (pp)", f"{metrics.get('rel_strength_pp', 0.0):.2f}" if metrics.get('rel_strength_pp') is not None else "n/a")
+        with col_metrics[2]:
+            st.metric("High20", f"{metrics.get('high20', 0.0):.2f}" if isinstance(metrics.get('high20'), (int, float)) else "n/a")
+            st.metric("Low20", f"{metrics.get('low20', 0.0):.2f}" if isinstance(metrics.get('low20'), (int, float)) else "n/a")
+            st.metric("Vol surge", f"{metrics.get('vol_surge', 0.0):.2f}" if metrics.get('vol_surge') is not None else "n/a")
+            st.metric("SPY regime", "OK" if metrics.get('spy_regime_ok', True) else "Weak")
+        # Guard panels
+        with st.expander("🛡️ BuyGuard checks"):
+            def bc(val: bool) -> str:
+                return "✅" if val else "❌"
+            st.write(f"RelStr>0: {bc(flags.get('rel_ok'))}")
+            st.write(f"MACD>Signal: {bc(flags.get('macd_ok'))}")
+            st.write(f"Breakout/VolOK or NearHigh: {bc(flags.get('breakout_vol_ok') or flags.get('near_high') or flags.get('vol_ok_simple'))}")
+            st.write(f"SPY regime OK: {bc(flags.get('spy_regime_ok'))}")
+            st.write(f"BuyGuard result: {bc(flags.get('buy_guard_ok'))}")
+        with st.expander("🛑 SellGuard checks"):
+            def sc(val: bool) -> str:
+                return "✅" if val else "❌"
+            st.write(f"RelStr<0: {sc(sell_flags.get('rel_neg'))}")
+            st.write(f"MACD<Signal: {sc(sell_flags.get('macd_neg'))}")
+            st.write(f"Near 20d low: {sc(sell_flags.get('near_low'))}")
+            st.write(f"High volume down: {sc(sell_flags.get('high_volume_down'))}")
+            st.write(f"SPY regime weak: {sc(sell_flags.get('spy_regime_weak'))}")
+            st.write(f"SellGuard result: {sc(sell_flags.get('sell_guard_ok'))}")
+        # Determine action
+        action = "HOLD"
+        # Determine whether we are currently in a position
+        in_pos = st.session_state['console_positions'].get(tkr) is not None
+        if not in_pos:
+            # Consider a BUY when buy guard is ok
+            if flags.get('buy_guard_ok'):
+                action = "BUY"
+        else:
+            # Consider exit when sell guard is ok
+            if sell_flags.get('sell_guard_ok'):
+                action = "EXIT"
+            else:
+                action = "HOLD"
+        # Show action and order plan
+        st.markdown(f"#### Suggested action: **{action}**")
+        if action == "BUY":
+            # Compute order plan
+            order_plan = generate_order_plan(metrics.get('price'), metrics.get('atr'), acct_size, risk_pct, side="BUY")
+            if order_plan:
+                st.write(f"**Entry price:** {metrics.get('price'):.2f}")
+                st.write(f"**Stop loss:** {order_plan['stop']:.2f}")
+                st.write(f"**Take profit:** {order_plan['take_profit']:.2f}")
+                st.write(f"**Quantity:** {order_plan['quantity']}")
+                st.write(f"**Risk/share:** ${order_plan['risk_per_share']:.2f}, Risk amount: ${order_plan['risk_amount']:.2f}")
+                st.write(f"**Approx. R:R:** {order_plan['rr']}")
+        elif action == "EXIT":
+            st.write("Consider closing the position or taking partial profits based on your plan.")
+        # Backtest summary
+        with st.expander("📊 Intraday backtest (last 20 days)"):
+            backtest = intraday_backtest(tkr, days=20, interval="1m")
+            if backtest:
+                st.write(f"Trades: {backtest['trades']}")
+                st.write(f"Win rate: {backtest['win_rate']}%")
+                st.write(f"Avg return: {backtest['avg_return']}%")
+                st.write(f"Max drawdown: {backtest['max_drawdown']}%" if backtest.get('max_drawdown') is not None else "Max drawdown: n/a")
+                st.write(f"Profit factor: {backtest['profit_factor']}" if backtest.get('profit_factor') is not None else "Profit factor: n/a")
+            else:
+                st.write("Not enough data or unable to perform backtest.")
+        # Journal quick log
+        with st.expander("📝 Journal this signal"):
+            reasons = ["Setup met", "Missed entry", "News event", "Rule break"]
+            sel_reason = st.selectbox("Reason", reasons, key=f"journal_reason_{tkr}")
+            note = st.text_input("Notes", key=f"journal_note_{tkr}")
+            if st.button("Log entry", key=f"journal_btn_{tkr}"):
+                st.session_state['console_journal'].append({
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'ticker': tkr,
+                    'price': metrics.get('price'),
+                    'action': action,
+                    'reason': sel_reason,
+                    'note': note
+                })
+                st.success("Logged to journal")
+    # Display journal summary
+    if st.session_state['console_journal']:
+        with st.expander("📚 Journal entries"):
+            st.table(pd.DataFrame(st.session_state['console_journal']))
+
+# -----------------------------------------------------------------------------
 # Caching layers for price, fundamental and macro data to mitigate repeated
 # yfinance calls and provide basic robustness against network hiccups.  All
 # download functions fallback to empty structures on failure.  Prices are
@@ -1971,8 +2596,22 @@ if go is None:
 
 state = load_watchlist()
 
+# If the user selected the Trading Console page in the sidebar, display it and stop further execution
+try:
+    selected_page = page  # use the value from the sidebar radio defined above
+except Exception:
+    selected_page = "Watchlist"
+if selected_page == "Trading Console":
+    # Render the Trading Console page using the current state (settings)
+    trading_console(state)
+    # Stop execution of the rest of the script so the watchlist does not render
+    st.stop()
+
 # Sidebar
 with st.sidebar:
+    # Navigation: choose between the watchlist and the trading console
+    page = st.radio("Select page", ["Watchlist", "Trading Console"], key="page_nav")
+    st.markdown("---")
     st.subheader("⚙️ Settings")
     profile = st.selectbox("Risk profile", list(PROFILE_CONFIG.keys()),
                            index=list(PROFILE_CONFIG.keys()).index(state.get("profile", DEFAULT_PROFILE)))
@@ -2023,13 +2662,13 @@ with st.sidebar:
         save_watchlist(state)
         st.toast("Settings saved", icon="✅")
 
-# Auto refresh
-if state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
-    st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
-
-with st.sidebar:
+    # Manual refresh button
     if st.button("🔄 Refresh now"):
         st.rerun()  # <- fixed
+
+    # Auto refresh using streamlit_autorefresh if enabled and page is watchlist
+    if page == "Watchlist" and state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
+        st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
 
 # Main
 watch = state.get("tickers", [])
