@@ -2578,6 +2578,7 @@ def save_watchlist(state: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+
 # ---------------- UI ----------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -2594,34 +2595,34 @@ if go is None:
     st.error("Missing dependency: 'plotly'. Add it to requirements.txt.")
     st.stop()
 
+# Load persisted state (needed for defaults in the sidebar)
 state = load_watchlist()
 
-# If the user selected the Trading Console page in the sidebar, display it and stop further execution
-try:
-    selected_page = page  # use the value from the sidebar radio defined above
-except Exception:
-    selected_page = "Watchlist"
-if selected_page == "Trading Console":
-    # Render the Trading Console page using the current state (settings)
-    trading_console(state)
-    # Stop execution of the rest of the script so the watchlist does not render
-    st.stop()
-
-# Sidebar
+# -------- Sidebar (define `page` BEFORE using it) --------
 with st.sidebar:
-    # Navigation: choose between the watchlist and the trading console
+    # Navigation
     page = st.radio("Select page", ["Watchlist", "Trading Console"], key="page_nav")
+
     st.markdown("---")
     st.subheader("⚙️ Settings")
-    profile = st.selectbox("Risk profile", list(PROFILE_CONFIG.keys()),
-                           index=list(PROFILE_CONFIG.keys()).index(state.get("profile", DEFAULT_PROFILE)))
-    auto_minutes = st.number_input("Auto-refresh (minutes)", min_value=0, max_value=60,
-                                   value=int(state.get("auto_refresh_minutes", 15)), step=1,
-                                   help="0 disables auto refresh")
+
+    profile = st.selectbox(
+        "Risk profile",
+        list(PROFILE_CONFIG.keys()),
+        index=list(PROFILE_CONFIG.keys()).index(state.get("profile", DEFAULT_PROFILE))
+    )
+
+    auto_minutes = st.number_input(
+        "Auto-refresh (minutes)", min_value=0, max_value=60,
+        value=int(state.get("auto_refresh_minutes", 15)), step=1,
+        help="0 disables auto refresh"
+    )
 
     st.markdown("---")
     st.subheader("👀 Watchlist")
-    tickers_text = st.text_input("Add ticker(s) (comma-separated)", placeholder="e.g. AAPL, MSFT, NVDA")
+
+    tickers_text = st.text_input("Add ticker(s) (comma-separated)",
+                                 placeholder="e.g. AAPL, MSFT, NVDA")
     if st.button("➕ Add to watchlist"):
         if tickers_text.strip():
             new = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
@@ -2640,15 +2641,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📏 Position sizing")
-    acct_size = st.number_input("Account size ($)", min_value=0.0, value=float(state.get("acct_size", 10000.0)), step=100.0)
-    risk_pct  = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=float(state.get("risk_pct", 1.0)), step=0.1)
+    acct_size = st.number_input("Account size ($)", min_value=0.0,
+                                value=float(state.get("acct_size", 10000.0)), step=100.0)
+    risk_pct  = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0,
+                                value=float(state.get("risk_pct", 1.0)), step=0.1)
 
     st.markdown("---")
     st.subheader("🔒 Buy-guard & stops")
     relax_guards = st.checkbox("Relax guards (test mode)", value=bool(state.get("relax_guards", False)))
     market_guard = st.checkbox("Enforce SPY regime", value=bool(state.get("market_guard", True)))
     ts_enabled   = st.checkbox("Use trailing stop instead of fixed SL", value=bool(state.get("ts_enabled", False)))
-    ts_mult      = st.number_input("Trailing stop ATR multiple", min_value=0.5, max_value=5.0, value=float(state.get("ts_mult", 1.5)), step=0.1)
+    ts_mult      = st.number_input("Trailing stop ATR multiple", min_value=0.5, max_value=5.0,
+                                   value=float(state.get("ts_mult", 1.5)), step=0.1)
 
     if st.button("💾 Save settings"):
         state["profile"] = profile
@@ -2664,11 +2668,20 @@ with st.sidebar:
 
     # Manual refresh button
     if st.button("🔄 Refresh now"):
-        st.rerun()  # <- fixed
+        st.rerun()
 
-    # Auto refresh using streamlit_autorefresh if enabled and page is watchlist
+    # Auto-refresh (only on Watchlist page)
     if page == "Watchlist" and state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
         st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
+
+# -------- Page routing --------
+if page == "Trading Console":
+    # The console page already exists in the file as trading_console(state)
+    trading_console(state)   # <- render console
+    st.stop()                # <- do not render watchlist below
+
+# (from here down remains your original Watchlist main content)
+
 
 # Main
 watch = state.get("tickers", [])
