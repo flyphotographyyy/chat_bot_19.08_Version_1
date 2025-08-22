@@ -149,149 +149,168 @@ def ema(series: pd.Series, span: int) -> pd.Series:
     """Compute exponential moving average with given span on a pandas series."""
     return series.ewm(span=span, adjust=False).mean()
 
-def compute_intraday_metrics(df: pd.DataFrame, spy_df: pd.DataFrame | None = None) -> Tuple[Dict[str, Any], Dict[str, bool], Dict[str, bool]]:
-    """Compute a set of intraday metrics and guard flags from a history of prices.
-
-    The input DataFrame must contain at least a 'Close' column and should be
-    ordered by ascending timestamp.  Additional columns 'High', 'Low' and
-    'Volume' will enhance the calculations but are optional.  When absent,
-    high/low values are approximated by using the close price and volume-based
-    checks are disabled.
-
-    Parameters
-    ----------
-    df : DataFrame
-        Intraday price history, most recent row last.
-    spy_df : DataFrame, optional
-        SPY intraday history for computing relative strength and market regime.
-
-    Returns
-    -------
-    metrics : dict
-        Dictionary of computed indicators.
-    flags : dict
-        Dictionary of boolean buy-guard related flags.
-    sell_flags : dict
-        Dictionary of boolean sell-guard related flags.
+def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = None):
     """
-    metrics: Dict[str, Any] = {}
-    flags: Dict[str, bool] = {}
-    sell_flags: Dict[str, bool] = {}
-    if df is None or df.empty or 'Close' not in df.columns or len(df) < 20:
-        # Not enough data
-        metrics['error'] = 'Not enough intraday data'
-        return metrics, flags, sell_flags
-    # Ensure we work on a copy to avoid modifying state
-    d = df.copy().reset_index(drop=True)
-    # Use close prices
-    prices = d['Close'].astype(float)
-    # Basic metrics
-    last_price = float(prices.iloc[-1])
-    metrics['price'] = last_price
-    metrics['delta_pct'] = ((last_price - float(prices.iloc[0])) / float(prices.iloc[0])) * 100.0 if len(prices) > 0 else None
-    # Compute simple moving averages
-    sma20 = prices.rolling(window=20).mean()
-    sma50 = prices.rolling(window=50).mean()
-    metrics['sma20'] = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else None
-    metrics['sma50'] = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else None
-    # ATR: approximate using absolute price changes
-    diff = prices.diff().abs()
-    atr14 = diff.rolling(window=14).mean()
-    metrics['atr'] = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else None
-    # RSI calculation (14-period)
-    delta = prices.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.rolling(14).mean()
-    roll_down = down.rolling(14).mean()
-    rs = roll_up / roll_down
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    metrics['rsi'] = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else None
-    # High/Low approximations
-    high20 = float(prices.iloc[-20: ].max())
-    low20 = float(prices.iloc[-20: ].min())
-    metrics['high20'] = high20
-    metrics['low20'] = low20
-    # Breakout range normalized
-    if high20 != low20:
-        metrics['bb_pos'] = (last_price - low20) / (high20 - low20)
-    else:
-        metrics['bb_pos'] = 0.0
-    # MACD and signal line using EMA spans 12/26/9
-    macd_line = ema(prices, 12) - ema(prices, 26)
-    signal_line = ema(macd_line, 9)
-    metrics['macd'] = float(macd_line.iloc[-1])
-    metrics['macd_signal'] = float(signal_line.iloc[-1])
-    # Relative strength vs SPY (20-period percentage performance difference)
-    rel_strength_pp = None
-    spy_regime_ok = True
-    if spy_df is not None and not spy_df.empty and 'Close' in spy_df.columns and len(spy_df) >= len(d):
-        sp = spy_df['Close'].astype(float).reset_index(drop=True)
-        # Align lengths by trimming to same length
-        if len(sp) > len(prices):
-            sp = sp.iloc[-len(prices):].reset_index(drop=True)
-        elif len(prices) > len(sp):
-            prices = prices.iloc[-len(sp):].reset_index(drop=True)
-            d = d.iloc[-len(sp):].reset_index(drop=True)
-        # Compute percentage performance over last 20 periods
-        if len(prices) >= 21 and len(sp) >= 21:
-            perf_t = (prices.iloc[-1] - prices.iloc[-21]) / prices.iloc[-21]
-            perf_spy = (sp.iloc[-1] - sp.iloc[-21]) / sp.iloc[-21]
-            rel_strength_pp = 100.0 * (perf_t - perf_spy)
-    metrics['rel_strength_pp'] = rel_strength_pp
-    # SPY regime: simple check if SPY price above its 50 period SMA and upward sloping
-    if spy_df is not None and not spy_df.empty and 'Close' in spy_df.columns and len(spy_df) >= 50:
-        spy_close = spy_df['Close'].astype(float)
-        spy_sma50 = spy_close.rolling(window=50).mean()
-        spy_sma20 = spy_close.rolling(window=20).mean()
-        # slope positive if current SMA is above previous by a small margin
-        spy_slope = spy_sma50.iloc[-1] - spy_sma50.iloc[-20] if not np.isnan(spy_sma50.iloc[-20]) else 0.0
-        spy_regime_ok = bool((spy_close.iloc[-1] >= spy_sma50.iloc[-1]) and (spy_slope >= 0))
-    metrics['spy_regime_ok'] = spy_regime_ok
-    # Volume surge: only if Volume column exists
-    vol_ok_simple = None
+    Връща (metrics, buy_flags, sell_flags) върху 1m история.
+    МЕТРИКИ: price, delta_pct, sma20/50, rsi, atr, bb_pos, high20/low20, vol_surge,
+             rel_strength_pp, spy_regime_ok
+    BUY FLAGS: rel_ok, macd_ok, breakout_vol_ok/near_high, vol_ok_simple, spy_regime_ok, buy_guard_ok
+    SELL FLAGS: rel_neg, macd_neg, near_low, high_volume_down, spy_regime_weak, sell_guard_ok
+    """
+    df = hist.copy()
+
+    # --- индекс и типове ---
+    if "Datetime" in df.columns:
+        df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
+        df = df.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
+    # числови колони
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ако липсват O/H/L, ги приравняваме към Close (за да работят ATR/BB)
+    if "Close" not in df.columns:
+        raise ValueError("History missing 'Close' column.")
+    for c in ["Open", "High", "Low"]:
+        if c not in df.columns:
+            df[c] = df["Close"]
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+
+    # нужни точки
+    n = len(df)
+    if n < 2:
+        # няма какво да смятаме
+        price = _lastf(df["Close"])
+        return (
+            {"price": price, "delta_pct": None},
+            {"buy_guard_ok": False, "spy_regime_ok": True},
+            {"sell_guard_ok": False, "spy_regime_weak": False},
+        )
+
+    # --- базови серии ---
+    close = df["Close"]
+    high = df["High"]
+    low  = df["Low"]
+    vol  = df["Volume"]
+
+    price = _lastf(close)
+    first = _lastf(close.iloc[[0]])
+    delta_pct = None
+    if price is not None and first is not None and first != 0:
+        delta_pct = (price / first - 1.0) * 100.0
+
+    # --- индикатори ---
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    rsi14 = rsi(close.astype(float), 14)
+    # ATR (rolling 14)
+    atr14 = atr(pd.DataFrame({"High": high, "Low": low, "Close": close}), 14)
+
+    # Bollinger band position (0..1)
+    bb_mid = sma20
+    bb_std = close.rolling(20).std()
+    bb_up  = bb_mid + 2 * bb_std
+    bb_dn  = bb_mid - 2 * bb_std
+    width  = (bb_up - bb_dn)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bb_pos = (close - bb_dn) / width
+
+    # 20-свинг highs/lows
+    high20 = high.rolling(20).max()
+    low20  = low.rolling(20).min()
+    near_high = False
+    near_low  = False
+    if price is not None:
+        h20 = _lastf(high20)
+        l20 = _lastf(low20)
+        if h20:
+            near_high = (h20 - price) / h20 <= 0.01
+        if l20:
+            near_low  = (price - l20) / (l20 if l20 else 1) <= 0.01
+
+    # обем
+    vol_avg20 = vol.rolling(20).mean()
     vol_surge = None
-    if 'Volume' in d.columns:
-        vol = d['Volume'].astype(float)
-        if len(vol) >= 20:
-            avg20 = vol.iloc[-20:].mean()
-            current_vol = vol.iloc[-1]
-            vol_surge = current_vol / avg20 if avg20 else None
-            # consider vol surge >= 1.3 significant
-            vol_ok_simple = bool(vol_surge is not None and vol_surge >= 1.3)
-    metrics['vol_surge'] = float(vol_surge) if vol_surge is not None else None
-    # Guard flags for buy logic
-    rel_ok = (rel_strength_pp is None) or (rel_strength_pp > 0)
-    macd_ok = metrics['macd'] > metrics['macd_signal']
-    near_high = last_price >= (high20 * 0.995)
-    breakout = last_price > high20
-    breakout_vol_ok = breakout or (vol_ok_simple if vol_ok_simple is not None else False)
-    flags['rel_ok'] = rel_ok
-    flags['macd_ok'] = macd_ok
-    flags['near_high'] = near_high
-    flags['breakout_vol_ok'] = breakout_vol_ok
-    flags['vol_ok_simple'] = bool(vol_ok_simple) if vol_ok_simple is not None else False
-    flags['spy_regime_ok'] = spy_regime_ok
-    # Combined buy guard result
-    flags['buy_guard_ok'] = bool(rel_ok and macd_ok and (breakout_vol_ok or near_high) and spy_regime_ok)
-    # Guard flags for sell logic
-    rel_neg = (rel_strength_pp is not None) and (rel_strength_pp < 0)
-    macd_neg = metrics['macd'] < metrics['macd_signal']
-    near_low = last_price <= (low20 * 1.005)
-    # High volume down: if price decreased and volume surged
-    high_volume_down = False
-    if 'Volume' in d.columns and vol_surge is not None:
-        price_change = prices.iloc[-1] - prices.iloc[-2] if len(prices) >= 2 else 0.0
-        high_volume_down = (price_change < 0) and (vol_surge >= 1.3)
-    sell_flags['rel_neg'] = rel_neg
-    sell_flags['macd_neg'] = macd_neg
-    sell_flags['near_low'] = near_low
-    sell_flags['high_volume_down'] = high_volume_down
-    sell_flags['sl_hit'] = False  # updated externally if needed
-    sell_flags['spy_regime_weak'] = not spy_regime_ok
-    # Combined sell guard
-    sell_flags['sell_guard_ok'] = bool(rel_neg and (macd_neg or near_low or high_volume_down))
-    return metrics, flags, sell_flags
+    if _lastf(vol_avg20):
+        v = _lastf(vol)
+        va = _lastf(vol_avg20)
+        if v is not None and va:
+            vol_surge = v / va
+
+    # MACD (върху close)
+    macd_line, macd_sig, _ = macd(close.astype(float))
+    macd_ok  = (_lastf(macd_line) is not None) and (_lastf(macd_sig) is not None) and (_lastf(macd_line) > _lastf(macd_sig))
+    macd_neg = (_lastf(macd_line) is not None) and (_lastf(macd_sig) is not None) and (_lastf(macd_line) < _lastf(macd_sig))
+
+    # RelStr vs SPY (20 барa, в pp) и SPY regime (ако имаме SPY)
+    rel_strength_pp = None
+    spy_regime_ok   = True
+    spy_regime_weak = False
+    if spy_df is not None and not spy_df.empty:
+        sp = spy_df.copy()
+        if "Datetime" in sp.columns:
+            sp["Datetime"] = pd.to_datetime(sp["Datetime"], errors="coerce", utc=True)
+            sp = sp.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
+        sp_close = pd.to_numeric(sp["Close"], errors="coerce")
+        # замерване на относителна доходност за същия прозорец
+        ret_sym = close.pct_change(20)
+        ret_spy = sp_close.pct_change(20).reindex_like(ret_sym).ffill()
+        if len(ret_sym) and len(ret_spy):
+            rel_strength_pp = float((ret_sym.iloc[-1] - ret_spy.iloc[-1]) * 100.0)
+        # прост режим за SPY – възходящ и RSI>45
+        sp50 = sp_close.rolling(50).mean()
+        sp200 = sp_close.rolling(200).mean()
+        sp_rsi = rsi(sp_close, 14)
+        spy_regime_ok   = (_lastf(sp50) is not None and _lastf(sp200) is not None and _lastf(sp50) > _lastf(sp200) and (_lastf(sp_rsi) or 0) > 45)
+        spy_regime_weak = not spy_regime_ok
+
+    # --- метрики (все float/None) ---
+    metrics = {
+        "price": price,
+        "delta_pct": delta_pct,
+        "sma20": _lastf(sma20),
+        "sma50": _lastf(sma50),
+        "rsi": _lastf(rsi14),
+        "atr": _lastf(atr14),
+        "bb_pos": _lastf(bb_pos),
+        "high20": _lastf(high20),
+        "low20": _lastf(low20),
+        "vol_surge": vol_surge,
+        "rel_strength_pp": rel_strength_pp,
+        "spy_regime_ok": bool(spy_regime_ok),
+    }
+
+    # --- BuyGuard (интрадей) – базова логика ---
+    rel_ok = (rel_strength_pp is None) or (rel_strength_pp > 0)  # ако нямаме SPY → не блокирай
+    vol_ok_simple = (vol_surge is not None and vol_surge >= 1.1)
+    breakout_vol_ok = bool(near_high or vol_ok_simple)
+    buy_guard_ok = bool(rel_ok and macd_ok and breakout_vol_ok and spy_regime_ok)
+
+    # --- SellGuard (интрадей) ---
+    rel_neg = (rel_strength_pp is not None and rel_strength_pp < 0)
+    high_volume_down = (vol_surge is not None and vol_surge >= 1.3 and _lastf(close.diff()) is not None and close.diff().iloc[-1] < 0)
+    sell_guard_ok = bool(rel_neg or macd_neg or near_low or high_volume_down)
+
+    buy_flags = {
+        "rel_ok": rel_ok,
+        "macd_ok": macd_ok,
+        "breakout_vol_ok": breakout_vol_ok,
+        "vol_ok_simple": vol_ok_simple,
+        "near_high": near_high,
+        "spy_regime_ok": spy_regime_ok,
+        "buy_guard_ok": buy_guard_ok,
+    }
+    sell_flags = {
+        "rel_neg": rel_neg,
+        "macd_neg": macd_neg,
+        "near_low": near_low,
+        "high_volume_down": high_volume_down,
+        "spy_regime_weak": spy_regime_weak,
+        "sell_guard_ok": sell_guard_ok,
+    }
+    return metrics, buy_flags, sell_flags
+
 
 def generate_order_plan(price: float, atr: float, acct_size: float, risk_pct: float, side: str = "BUY") -> Dict[str, Any]:
     """Generate a simple bracket order plan given entry price, ATR, account size and risk.
@@ -951,6 +970,20 @@ def seed_last_session_into_session(ticker: str, min_points: int = MIN_INTRADAY_P
         return True, f"Seeded {len(dfr)} bars for {ticker}."
     except Exception as e:
         return False, f"Seed failed for {ticker}: {e}"
+
+def _lastf(s: pd.Series) -> float | None:
+    """Връща последната стойност като float или None (безопасно за NaN/обектни типове)."""
+    try:
+        if s is None or len(s) == 0:
+            return None
+        v = s.iloc[-1]
+        v = pd.to_numeric(v, errors="coerce")
+        if pd.isna(v):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
 
 
     
