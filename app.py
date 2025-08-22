@@ -407,47 +407,34 @@ def intraday_backtest(ticker: str, days: int = 20, interval: str = "1m") -> Dict
         }
     except Exception:
         return {}
-
 def trading_console(state: Dict[str, Any]):
-    """Render the Trading Console page.  This interface allows the user to
-    select one or more tickers, input prices manually or fetch them via the
-    yfinance API, compute intraday indicators, evaluate BuyGuard/SellGuard
-    conditions, generate order plans and display simple intraday backtest
-    statistics.  The console maintains per-ticker history in session_state.
-
-    Parameters
-    ----------
-    state : dict
-        Persistent watchlist settings (account size, risk %, etc.) to use for
-        risk calculations.  This function does not modify the watchlist.
-    """
+    """Trading Console – multi-ticker, Manual/Auto, с Buy/SellGuard, OrderPlan и Intraday backtest."""
     st.markdown("## 📈 Trading Console")
-    # Initialize session state containers for console
-    if 'console_tickers' not in st.session_state:
-        st.session_state['console_tickers'] = []
-    if 'console_history' not in st.session_state:
-        st.session_state['console_history'] = {}
-    if 'console_positions' not in st.session_state:
-        st.session_state['console_positions'] = {}
-    if 'console_journal' not in st.session_state:
-        st.session_state['console_journal'] = []
-    # Search and add tickers
+
+    # --- session state ---
+    st.session_state.setdefault('console_tickers', [])
+    st.session_state.setdefault('console_history', {})
+    st.session_state.setdefault('console_positions', {})
+    st.session_state.setdefault('console_journal', [])
+
+    # --- search & add tickers (със suggestions) ---
     st.markdown("### 🔍 Add tickers to console")
-    search_query = st.text_input("Search ticker", key="console_search", placeholder="Type ticker or company name")
-    if search_query:
-        suggestions = _search_ticker_via_yf(search_query, max_results=5)
+    q = st.text_input("Search ticker", key="console_search", placeholder="Type ticker or company name")
+    if q:
+        suggestions = _search_ticker_via_yf(q, max_results=5)
         if suggestions:
-            sel = st.selectbox("Suggestions", options=[f"{s} – {n}" for s, n in suggestions], key="console_suggestion")
+            pick = st.selectbox("Suggestions", [f"{s} – {n}" for s, n in suggestions], key="console_suggestion")
             if st.button("Add selected"):
-                ticker = sel.split(" – ")[0].strip().upper()
-                if ticker and ticker not in st.session_state['console_tickers']:
-                    st.session_state['console_tickers'].append(ticker)
-                    st.success(f"Added {ticker}")
+                sym = pick.split(" – ")[0].strip().upper()
+                if sym and sym not in st.session_state['console_tickers']:
+                    st.session_state['console_tickers'].append(sym)
+                    st.success(f"Added {sym}")
         else:
             st.caption("No suggestions found.")
-    manual = st.text_input("Add ticker manually", key="console_manual", placeholder="e.g. AAPL")
+
+    manual_sym = st.text_input("Add ticker manually", key="console_manual", placeholder="e.g. AAPL")
     if st.button("Add manual ticker"):
-        sym = manual.strip().upper() if manual else ""
+        sym = (manual_sym or "").strip().upper()
         if sym:
             if sym not in st.session_state['console_tickers']:
                 st.session_state['console_tickers'].append(sym)
@@ -456,46 +443,54 @@ def trading_console(state: Dict[str, Any]):
                 st.info(f"{sym} already in console")
         else:
             st.warning("Enter a valid symbol")
-    # Remove tickers
+
+    # remove
     if st.session_state['console_tickers']:
-        rem = st.multiselect("Remove tickers", options=st.session_state['console_tickers'], key="console_remove")
-        if st.button("Remove selected tickers") and rem:
-            st.session_state['console_tickers'] = [t for t in st.session_state['console_tickers'] if t not in rem]
-            for r in rem:
+        to_remove = st.multiselect("Remove tickers", st.session_state['console_tickers'], key="console_remove")
+        if st.button("Remove selected tickers") and to_remove:
+            st.session_state['console_tickers'] = [t for t in st.session_state['console_tickers'] if t not in to_remove]
+            for r in to_remove:
                 st.session_state['console_history'].pop(r, None)
                 st.session_state['console_positions'].pop(r, None)
-            st.warning(f"Removed {', '.join(rem)}")
+            st.warning(f"Removed {', '.join(to_remove)}")
+
     st.markdown("---")
-    # Mode selection: manual or auto
-    mode = st.radio("Price update mode", ["Manual", "Auto (requires API)"] , key="console_mode")
-    # For manual mode: display inputs for each ticker
+
+    # --- режим и рискови настройки ---
+    mode = st.radio("Price update mode", ["Manual", "Auto (requires API)"], key="console_mode")
+    acct_size = float(state.get("acct_size", 10000.0))
+    risk_pct  = float(state.get("risk_pct", 1.0))
+
     if not st.session_state['console_tickers']:
         st.info("Add at least one ticker to begin.")
         return
-    acct_size = float(state.get("acct_size", 10000.0))
-    risk_pct  = float(state.get("risk_pct", 1.0))
-    # Pre-fetch SPY intraday for relative strength and regime; if fails, it will be None
-    spy_history: pd.DataFrame | None = None
+
+    # SPY за RelStr и regime (само в Auto имаме смисъл да теглим)
+    spy_history = None
     if yf is not None and mode == "Auto (requires API)":
         try:
             spy_history = get_price_data("SPY", period="5d", interval="1m")
         except Exception:
             spy_history = None
-    else:
-        spy_history = None
-    # Price update section
+
+    # --- Price update секция ---
     if mode == "Manual":
         st.markdown("### 🕒 Manual price update")
-        # Show inputs for each ticker
-        price_cols = st.columns(min(4, len(st.session_state['console_tickers'])))
+
+        cols = st.columns(min(4, len(st.session_state['console_tickers'])))
         manual_prices: Dict[str, float | None] = {}
-        for idx, tkr in enumerate(st.session_state['console_tickers']):
-            with price_cols[idx % len(price_cols)]:
-                p = st.text_input(f"{tkr} price", key=f"console_price_{tkr}", placeholder="e.g. 145.23")
+
+        # вход: позволяваме „226,13“
+        for i, tkr in enumerate(st.session_state['console_tickers']):
+            with cols[i % len(cols)]:
+                raw_in = st.text_input(f"{tkr} price", key=f"console_price_{tkr}", placeholder="e.g. 145.23")
+                if raw_in:
+                    raw_in = raw_in.replace(",", ".").strip()
                 try:
-                    manual_prices[tkr] = float(p) if p else None
+                    manual_prices[tkr] = float(raw_in) if raw_in else None
                 except Exception:
                     manual_prices[tkr] = None
+
         if st.button("Update prices"):
             now = datetime.utcnow()
             for tkr, p in manual_prices.items():
@@ -503,19 +498,15 @@ def trading_console(state: Dict[str, Any]):
                     continue
                 hist = st.session_state['console_history'].get(tkr)
                 if hist is None or hist.empty:
-                    hist = pd.DataFrame({
-                        'Datetime': [now],
-                        'Close': [p]
-                    })
+                    hist = pd.DataFrame({'Datetime': [now], 'Close': [p]})
                 else:
-                    hist = hist.append({'Datetime': now, 'Close': p}, ignore_index=True)
+                    hist = pd.concat([hist, pd.DataFrame({'Datetime': [now], 'Close': [p]})], ignore_index=True)
                 st.session_state['console_history'][tkr] = hist
             st.success("Prices updated")
+
     else:
         st.markdown("### 🔄 Auto price update")
-        # For each ticker, fetch latest 1m bars from yfinance
-        refresh_btn = st.button("Refresh from API now")
-        if refresh_btn:
+        if st.button("Refresh from API now"):
             for tkr in st.session_state['console_tickers']:
                 try:
                     df = get_price_data(tkr, period="5d", interval="1m")
@@ -525,129 +516,132 @@ def trading_console(state: Dict[str, Any]):
                 except Exception:
                     st.warning(f"Failed to refresh {tkr}")
             st.success("Data refreshed from API")
+
     st.markdown("---")
-    # Display analysis for each ticker
+
+    # --- анализ по тикер ---
     for tkr in st.session_state['console_tickers']:
         st.markdown(f"### {tkr}")
         hist = st.session_state['console_history'].get(tkr)
+
+        # ако нямаме 20 точки – показваме бутон Seed last 1D
         if hist is None or hist.empty or len(hist) < 20:
             st.info("Need at least 20 data points to compute intraday metrics. Enter more prices or refresh.")
+            if yf is not None and st.button(f"Seed last 1D (yfinance) – {tkr}", key=f"seed_{tkr}"):
+                ok, msg = seed_last_1d_into_session(tkr)
+                (st.success if ok else st.warning)(msg)
+                st.rerun()
             continue
-        # Fetch SPY history for relative strength if not already loaded
-        spy_df = spy_history
-        if mode == "Manual" and spy_df is None:
-            spy_df = None
+
+        # fetch SPY (в Manual няма смисъл да теглим в реално време)
+        spy_df = spy_history if mode == "Auto (requires API)" else None
+
         metrics, flags, sell_flags = compute_intraday_metrics(hist, spy_df)
-        # Show chart
-        # Use plotly if available, else fallback to streamlit line_chart
+
+        # --- chart ---
         try:
             import plotly.graph_objects as go
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=hist['Datetime'], y=hist['Close'], mode='lines', name='Price'))
-            if metrics.get('sma20'):
-                # Compute SMA20 series for plotting
-                sma20_series = hist['Close'].rolling(window=20).mean()
-                fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma20_series, mode='lines', name='SMA20'))
-            if metrics.get('sma50'):
-                sma50_series = hist['Close'].rolling(window=50).mean()
-                fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma50_series, mode='lines', name='SMA50'))
+            sma20_s = hist['Close'].rolling(20).mean()
+            sma50_s = hist['Close'].rolling(50).mean()
+            if len(sma20_s.dropna()): fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma20_s, mode='lines', name='SMA20'))
+            if len(sma50_s.dropna()): fig.add_trace(go.Scatter(x=hist['Datetime'], y=sma50_s, mode='lines', name='SMA50'))
             fig.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=20), showlegend=True)
             st.plotly_chart(fig, use_container_width=True)
         except Exception:
             st.line_chart(hist.set_index('Datetime')['Close'])
-        # Key intraday metrics in columns
-        col_metrics = st.columns(3)
-        with col_metrics[0]:
-            st.metric("Price", f"{metrics.get('price', 'n/a'):.2f}" if isinstance(metrics.get('price'), (int, float)) else "n/a")
+
+        # --- key intraday metrics (3 колони под графиката) ---
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Price", f"{metrics.get('price', float('nan')):.2f}" if isinstance(metrics.get('price'), (int, float)) else "n/a")
             st.metric("Δ% since first", f"{metrics.get('delta_pct', 0.0):.2f}%" if isinstance(metrics.get('delta_pct'), (int, float)) else "n/a")
             st.metric("RSI(14)", f"{metrics.get('rsi', 0.0):.2f}" if isinstance(metrics.get('rsi'), (int, float)) else "n/a")
             st.metric("ATR", f"{metrics.get('atr', 0.0):.2f}" if isinstance(metrics.get('atr'), (int, float)) else "n/a")
-        with col_metrics[1]:
+        with c2:
             st.metric("SMA20", f"{metrics.get('sma20', 0.0):.2f}" if isinstance(metrics.get('sma20'), (int, float)) else "n/a")
             st.metric("SMA50", f"{metrics.get('sma50', 0.0):.2f}" if isinstance(metrics.get('sma50'), (int, float)) else "n/a")
             st.metric("BB pos", f"{metrics.get('bb_pos', 0.0)*100:.2f}%" if isinstance(metrics.get('bb_pos'), (int, float)) else "n/a")
             st.metric("RelStr (pp)", f"{metrics.get('rel_strength_pp', 0.0):.2f}" if metrics.get('rel_strength_pp') is not None else "n/a")
-        with col_metrics[2]:
+        with c3:
             st.metric("High20", f"{metrics.get('high20', 0.0):.2f}" if isinstance(metrics.get('high20'), (int, float)) else "n/a")
             st.metric("Low20", f"{metrics.get('low20', 0.0):.2f}" if isinstance(metrics.get('low20'), (int, float)) else "n/a")
             st.metric("Vol surge", f"{metrics.get('vol_surge', 0.0):.2f}" if metrics.get('vol_surge') is not None else "n/a")
             st.metric("SPY regime", "OK" if metrics.get('spy_regime_ok', True) else "Weak")
-        # Guard panels
+
+        # --- guards ---
         with st.expander("🛡️ BuyGuard checks"):
-            def bc(val: bool) -> str:
-                return "✅" if val else "❌"
+            bc = lambda v: "✅" if v else "❌"
             st.write(f"RelStr>0: {bc(flags.get('rel_ok'))}")
             st.write(f"MACD>Signal: {bc(flags.get('macd_ok'))}")
             st.write(f"Breakout/VolOK or NearHigh: {bc(flags.get('breakout_vol_ok') or flags.get('near_high') or flags.get('vol_ok_simple'))}")
             st.write(f"SPY regime OK: {bc(flags.get('spy_regime_ok'))}")
             st.write(f"BuyGuard result: {bc(flags.get('buy_guard_ok'))}")
+
         with st.expander("🛑 SellGuard checks"):
-            def sc(val: bool) -> str:
-                return "✅" if val else "❌"
+            sc = lambda v: "✅" if v else "❌"
             st.write(f"RelStr<0: {sc(sell_flags.get('rel_neg'))}")
             st.write(f"MACD<Signal: {sc(sell_flags.get('macd_neg'))}")
             st.write(f"Near 20d low: {sc(sell_flags.get('near_low'))}")
             st.write(f"High volume down: {sc(sell_flags.get('high_volume_down'))}")
             st.write(f"SPY regime weak: {sc(sell_flags.get('spy_regime_weak'))}")
             st.write(f"SellGuard result: {sc(sell_flags.get('sell_guard_ok'))}")
-        # Determine action
+
+        # --- action + order plan ---
         action = "HOLD"
-        # Determine whether we are currently in a position
         in_pos = st.session_state['console_positions'].get(tkr) is not None
-        if not in_pos:
-            # Consider a BUY when buy guard is ok
-            if flags.get('buy_guard_ok'):
-                action = "BUY"
-        else:
-            # Consider exit when sell guard is ok
-            if sell_flags.get('sell_guard_ok'):
-                action = "EXIT"
-            else:
-                action = "HOLD"
-        # Show action and order plan
+        if not in_pos and flags.get('buy_guard_ok'):
+            action = "BUY"
+        elif in_pos and sell_flags.get('sell_guard_ok'):
+            action = "EXIT"
+
         st.markdown(f"#### Suggested action: **{action}**")
         if action == "BUY":
-            # Compute order plan
-            order_plan = generate_order_plan(metrics.get('price'), metrics.get('atr'), acct_size, risk_pct, side="BUY")
-            if order_plan:
+            op = generate_order_plan(metrics.get('price'), metrics.get('atr'), acct_size, risk_pct, side="BUY")
+            if op:
                 st.write(f"**Entry price:** {metrics.get('price'):.2f}")
-                st.write(f"**Stop loss:** {order_plan['stop']:.2f}")
-                st.write(f"**Take profit:** {order_plan['take_profit']:.2f}")
-                st.write(f"**Quantity:** {order_plan['quantity']}")
-                st.write(f"**Risk/share:** ${order_plan['risk_per_share']:.2f}, Risk amount: ${order_plan['risk_amount']:.2f}")
-                st.write(f"**Approx. R:R:** {order_plan['rr']}")
+                st.write(f"**Stop loss:** {op['stop']:.2f}")
+                st.write(f"**Take profit:** {op['take_profit']:.2f}")
+                st.write(f"**Quantity:** {op['quantity']}")
+                st.write(f"**Risk/share:** ${op['risk_per_share']:.2f}, Risk amount: ${op['risk_amount']:.2f}")
+                st.write(f"**Approx. R:R:** {op['rr']}")
+
         elif action == "EXIT":
             st.write("Consider closing the position or taking partial profits based on your plan.")
-        # Backtest summary
+
+        # --- backtest ---
         with st.expander("📊 Intraday backtest (last 20 days)"):
-            backtest = intraday_backtest(tkr, days=20, interval="1m")
-            if backtest:
-                st.write(f"Trades: {backtest['trades']}")
-                st.write(f"Win rate: {backtest['win_rate']}%")
-                st.write(f"Avg return: {backtest['avg_return']}%")
-                st.write(f"Max drawdown: {backtest['max_drawdown']}%" if backtest.get('max_drawdown') is not None else "Max drawdown: n/a")
-                st.write(f"Profit factor: {backtest['profit_factor']}" if backtest.get('profit_factor') is not None else "Profit factor: n/a")
+            bt = intraday_backtest(tkr, days=20, interval="1m")
+            if bt:
+                st.write(f"Trades: {bt['trades']}")
+                st.write(f"Win rate: {bt['win_rate']}%")
+                st.write(f"Avg return: {bt['avg_return']}%")
+                st.write(f"Max drawdown: {bt['max_drawdown']}%" if bt.get('max_drawdown') is not None else "Max drawdown: n/a")
+                st.write(f"Profit factor: {bt['profit_factor']}" if bt.get('profit_factor') is not None else "Profit factor: n/a")
             else:
                 st.write("Not enough data or unable to perform backtest.")
-        # Journal quick log
+
+        # --- journal ---
         with st.expander("📝 Journal this signal"):
-            reasons = ["Setup met", "Missed entry", "News event", "Rule break"]
-            sel_reason = st.selectbox("Reason", reasons, key=f"journal_reason_{tkr}")
-            note = st.text_input("Notes", key=f"journal_note_{tkr}")
-            if st.button("Log entry", key=f"journal_btn_{tkr}"):
+            reason = st.selectbox("Reason", ["Setup met", "Missed entry", "News event", "Rule break"], key=f"jr_{tkr}")
+            note = st.text_input("Notes", key=f"jn_{tkr}")
+            if st.button("Log entry", key=f"jb_{tkr}"):
                 st.session_state['console_journal'].append({
                     'timestamp': datetime.utcnow().isoformat(),
                     'ticker': tkr,
                     'price': metrics.get('price'),
                     'action': action,
-                    'reason': sel_reason,
+                    'reason': reason,
                     'note': note
                 })
                 st.success("Logged to journal")
-    # Display journal summary
+
     if st.session_state['console_journal']:
         with st.expander("📚 Journal entries"):
             st.table(pd.DataFrame(st.session_state['console_journal']))
+
+
 
 # -----------------------------------------------------------------------------
 # Caching layers for price, fundamental and macro data to mitigate repeated
@@ -907,6 +901,23 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low_close  = (df['Low']  - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+def seed_last_1d_into_session(ticker: str) -> tuple[bool, str]:
+    """
+    Зарежда в session_state['console_history'][ticker] последните 1 ден (1m барове)
+    чрез get_price_data() и връща (ok, message).
+    """
+    try:
+        df = get_price_data(ticker, period="1d", interval="1m")
+        if df is None or df.empty:
+            return False, "No 1D@1m data from yfinance."
+        df = df.reset_index()
+        st.session_state.setdefault('console_history', {})
+        st.session_state['console_history'][ticker] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        return True, f"Seeded {len(df)} points for {ticker}."
+    except Exception as e:
+        return False, f"Seed failed for {ticker}: {e}"
+    
 
 # -----------------------------------------------------------------------------
 # Logistic regression helpers (pure NumPy)
