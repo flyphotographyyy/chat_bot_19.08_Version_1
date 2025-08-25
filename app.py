@@ -13,6 +13,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# -----------------------------------------------------------------------------
+# Additional imports for manual intraday seeding
+# We rely on the standard library's zoneinfo to handle timezone conversions
+# and io for in-memory CSV parsing.  These imports do not introduce any
+# heavy dependencies and allow users to upload or paste their own intraday
+# data directly into the app when yfinance is unavailable or insufficient.
+from zoneinfo import ZoneInfo
+import io
+
 # Optional deps
 try:
     import plotly.graph_objects as go
@@ -715,9 +724,41 @@ def trading_console(state: Dict[str, Any]):
             except Exception:
                 pass
 
-        # ако нямаме 20 точки – показваме бутон Seed last 1D
-        if hist is None or hist.empty or len(hist) < 20:
+        # ако нямаме 20 точки – показваме бутон Seed last 1D и панел за ръчно зареждане
+        if hist is None or hist.empty or len(hist) < MIN_INTRADAY_POINTS:
             st.info("Need at least 20 data points to compute intraday metrics. Enter more prices or refresh.")
+            # Панел за ръчно зареждане на интрадей данни чрез качване или paste
+            with st.expander("Seed from CSV / Paste (IBKR / TradingView / Excel)"):
+                up = st.file_uploader(f"Upload CSV for {tkr}", type=["csv", "txt"], key=f"up_{tkr}")
+                txt = st.text_area("Or paste rows here", key=f"paste_{tkr}",
+                                   placeholder="Datetime,Open,High,Low,Close,Volume")
+                tz_choice = st.selectbox("Timezone in file", ["America/New_York", "UTC", "Europe/Vienna"],
+                                          index=0, key=f"tz_{tkr}")
+                if st.button(f"Use pasted/uploaded data for {tkr}", key=f"use_paste_{tkr}"):
+                    try:
+                        # Determine which data to parse
+                        if up is not None:
+                            dfp = parse_intraday_text(up.getvalue(), tz_choice)
+                        elif txt.strip():
+                            dfp = parse_intraday_text(txt, tz_choice)
+                        else:
+                            st.warning("No data provided.")
+                            st.stop()
+                        # Validate parsed data
+                        if dfp is None or dfp.empty:
+                            st.warning("Parsed zero rows.")
+                            st.stop()
+                        if len(dfp) < MIN_INTRADAY_POINTS:
+                            st.warning(f"Parsed {len(dfp)} rows. Need ≥ {MIN_INTRADAY_POINTS}.")
+                            st.stop()
+                        # Save to session and rerun
+                        st.session_state.setdefault("console_history", {})
+                        st.session_state["console_history"][tkr] = dfp.copy()
+                        st.success(f"Loaded {len(dfp)} 1-min bars for {tkr}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Parsing failed: {e}")
+            # Seed last 1D button using yfinance if available
             if yf is not None and st.button(f"Seed last 1D (yfinance) – {tkr}", key=f"seed_{tkr}"):
                 ok, msg = seed_last_session_into_session(tkr, min_points=MIN_INTRADAY_POINTS)
                 (st.success if ok else st.warning)(msg)
@@ -1101,6 +1142,167 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 MIN_INTRADAY_POINTS = 20
+
+#
+# CSV / Text intraday parser helpers
+#
+# To allow users to manually supply intraday OHLCV data (e.g. exported from
+# Interactive Brokers, TradingView or Excel), we define two helper functions.
+# `_normalise_ohlcv_cols` maps a variety of common column names to the
+# expected OHLCV schema and fills missing columns from the Close.  It also
+# coerces numeric values and handles list/tuple/array elements by taking
+# their first value.  `parse_intraday_text` accepts a text string or
+# bytes-like object, infers the delimiter, normalises the columns via
+# `_normalise_ohlcv_cols`, localises the datetime values to a user‑selected
+# timezone, converts them to UTC and drops any rows with invalid or missing
+# timestamps.  The resulting DataFrame always contains at least the
+# columns Datetime, Open, High, Low, Close and Volume.
+
+def _normalise_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names and fill missing OHLCV fields.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Raw intraday data from user input.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Dataframe with columns [Datetime, Open, High, Low, Close, Volume].
+    """
+    # Lowercase and strip whitespace from all column names
+    cols = [str(x).strip().lower() for x in df.columns]
+    df.columns = cols
+
+    # Helper to pick the first matching column name from a list of options
+    def pick(*names: str) -> str | None:
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    # Attempt to construct a Datetime column
+    if "datetime" not in df.columns:
+        # If both date and time columns exist, combine them
+        if {"date", "time"}.issubset(df.columns):
+            df["datetime"] = df["date"].astype(str) + " " + df["time"].astype(str)
+        elif "timestamp" in df.columns:
+            df["datetime"] = df["timestamp"]
+        else:
+            # If no obvious datetime column, treat the first column as datetime
+            # This covers cases where the first column is a naive datetime string
+            df = df.rename(columns={df.columns[0]: "datetime"})
+
+    # Identify OHLCV columns; fallback to None if absent
+    open_col  = pick("open", "o")
+    high_col  = pick("high", "h")
+    low_col   = pick("low", "l")
+    close_col = pick("close", "last", "price", "c")
+    vol_col   = pick("volume", "vol", "qty", "size", "v")
+
+    if close_col is None:
+        raise ValueError("No Close/Last/Price column found in uploaded data.")
+
+    # Build the normalised output DataFrame
+    out = pd.DataFrame()
+    out["Datetime"] = df["datetime"]
+
+    def to_scalar(x: Any) -> Any:
+        """If x is list/tuple/array, return its first element; else return x."""
+        if isinstance(x, (list, tuple, np.ndarray)):
+            return x[0] if len(x) else np.nan
+        return x
+
+    # Close is mandatory; if conversion fails, NaN will be produced
+    out["Close"] = pd.to_numeric(df[close_col].apply(to_scalar), errors="coerce")
+
+    # Open/High/Low fall back to Close if missing
+    if open_col:
+        out["Open"] = pd.to_numeric(df[open_col].apply(to_scalar), errors="coerce")
+    else:
+        out["Open"] = out["Close"]
+
+    if high_col:
+        out["High"] = pd.to_numeric(df[high_col].apply(to_scalar), errors="coerce")
+    else:
+        out["High"] = out["Close"]
+
+    if low_col:
+        out["Low"] = pd.to_numeric(df[low_col].apply(to_scalar), errors="coerce")
+    else:
+        out["Low"] = out["Close"]
+
+    if vol_col:
+        out["Volume"] = pd.to_numeric(df[vol_col].apply(to_scalar), errors="coerce")
+    else:
+        # Default volume to zero if not provided
+        out["Volume"] = 0.0
+
+    return out
+
+
+def parse_intraday_text(text_or_bytes: Any, tz_name: str = "America/New_York") -> pd.DataFrame:
+    """Parse pasted text or uploaded bytes into a normalised intraday DataFrame.
+
+    Parameters
+    ----------
+    text_or_bytes : str | bytes
+        Raw CSV text or bytes from a file upload or text area.
+    tz_name : str, default "America/New_York"
+        Name of the timezone that the timestamps in the file are in.  Valid
+        values include "America/New_York", "UTC", "Europe/Vienna", etc.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame with columns Datetime, Open, High, Low, Close, Volume,
+        with times converted to naive UTC (timezone removed).
+    """
+    # Decode bytes to text if necessary
+    if isinstance(text_or_bytes, bytes):
+        txt = text_or_bytes.decode("utf-8", errors="ignore")
+    else:
+        txt = str(text_or_bytes or "")
+
+    # Standardise separators: unify semicolons and tabs as commas
+    txt = txt.replace(";", ",").replace("\t", ",")
+
+    # Use pandas to infer the delimiter and parse into a DataFrame
+    df = pd.read_csv(io.StringIO(txt), engine="python", sep=None)
+
+    # Normalise column names and values
+    df = _normalise_ohlcv_cols(df)
+
+    # Convert Datetime strings to timezone-aware and then to naive UTC
+    dt = pd.to_datetime(df["Datetime"], errors="coerce")
+
+    # If timezone info is missing, localise to tz_name; else assume it is already tz-aware
+    try:
+        if getattr(dt.dt.tz, "zone", None) is None and getattr(dt.dt.tz, "key", None) is None:
+            # Localise naive datetimes
+            dt = dt.dt.tz_localize(ZoneInfo(tz_name))
+    except Exception:
+        # If localisation fails, attempt naive localisation; fallback to UTC
+        try:
+            dt = dt.dt.tz_localize(ZoneInfo(tz_name))
+        except Exception:
+            dt = dt.dt.tz_localize(ZoneInfo("UTC"))
+
+    # Convert to UTC and drop timezone
+    try:
+        dt_utc = dt.dt.tz_convert(ZoneInfo("UTC")).dt.tz_convert(None)
+    except Exception:
+        # If conversion fails, drop tz and leave naive
+        dt_utc = dt
+
+    df["Datetime"] = dt_utc
+
+    # Drop rows with invalid datetimes or missing close values
+    df = df.dropna(subset=["Datetime", "Close"]).sort_values("Datetime")
+    df = df.drop_duplicates(subset=["Datetime"])
+
+    return df.reset_index(drop=True)
 
 def seed_last_session_into_session(ticker: str, min_points: int = MIN_INTRADAY_POINTS) -> tuple[bool, str]:
     """
