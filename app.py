@@ -283,6 +283,17 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
         df["Volume"] = 0.0
     # Remove rows without a close price
     df = df.dropna(subset=["Close"])
+
+    # Replace any NaN values in O/H/L columns with the corresponding Close value.  When
+    # prices are added manually via the "Update prices" button, only the Close
+    # price is provided and other OHLC fields are missing; filling these from
+    # the Close ensures downstream indicators (ATR, Bollinger, etc.) do not
+    # propagate NaNs.  Volume is also filled with zero where missing.
+    for c in ["Open", "High", "Low"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(df["Close"])
+    if "Volume" in df.columns:
+        df["Volume"] = df["Volume"].fillna(0)
     # If fewer than two data points remain, we cannot compute intraday metrics
     n = len(df)
     if n < 2:
