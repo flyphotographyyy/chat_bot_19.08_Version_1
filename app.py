@@ -229,8 +229,17 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     # _ensure_datetime_column), fall back to sorting the existing index if
     # it is a DatetimeIndex.  Otherwise leave as-is.
     if "Datetime" in df.columns:
+        # Convert to datetime (UTC) and safely filter out NaT values without raising KeyError
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
-        df = df.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
+        # Some dataframes may lose the column after conversion; re-check before filtering
+        if "Datetime" in df.columns:
+            # Filter rows where Datetime is not NaT and sort
+            df = df[df["Datetime"].notna()]
+            df = df.sort_values("Datetime")
+            df = df.set_index("Datetime")
+        elif isinstance(df.index, pd.DatetimeIndex):
+            # Fall back to sorting by index if column disappeared
+            df = df.sort_index()
     else:
         try:
             if isinstance(df.index, pd.DatetimeIndex):
@@ -329,7 +338,13 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
         sp = _ensure_datetime_column(spy_df.copy())
         if "Datetime" in sp.columns:
             sp["Datetime"] = pd.to_datetime(sp["Datetime"], errors="coerce", utc=True)
-            sp = sp.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
+            # Filter out NaTs without raising KeyError
+            if "Datetime" in sp.columns:
+                sp = sp[sp["Datetime"].notna()]
+                sp = sp.sort_values("Datetime")
+                sp = sp.set_index("Datetime")
+            elif isinstance(sp.index, pd.DatetimeIndex):
+                sp = sp.sort_index()
         elif isinstance(sp.index, pd.DatetimeIndex):
             # Already a DatetimeIndex after normalisation – just sort
             sp = sp.sort_index()
