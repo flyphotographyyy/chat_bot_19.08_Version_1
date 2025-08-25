@@ -157,15 +157,22 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     BUY FLAGS: rel_ok, macd_ok, breakout_vol_ok/near_high, vol_ok_simple, spy_regime_ok, buy_guard_ok
     SELL FLAGS: rel_neg, macd_neg, near_low, high_volume_down, spy_regime_weak, sell_guard_ok
     """
-    df = hist.copy()
+    # Work on a copy of the history and normalise the datetime column.  In
+    # practice hist may have the timestamp as an index or a column under a
+    # different name (e.g. 'index' after reset_index).  Normalising it
+    # early guarantees the rest of the logic always sees a 'Datetime'
+    # column to work with.  See `_ensure_datetime_column` for details.
+    df = _ensure_datetime_column(hist.copy())
 
     # --- индекс и типове ---
+    # Convert the datetime column to UTC and set it as index.  If there is
+    # still no 'Datetime' column at this point (unlikely because of
+    # _ensure_datetime_column), fall back to sorting the existing index if
+    # it is a DatetimeIndex.  Otherwise leave as-is.
     if "Datetime" in df.columns:
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
         df = df.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
-
     else:
-        # If the index is already a DatetimeIndex, just sort by index
         try:
             if isinstance(df.index, pd.DatetimeIndex):
                 df = df.sort_index()
@@ -256,11 +263,19 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     spy_regime_ok   = True
     spy_regime_weak = False
     if spy_df is not None and not spy_df.empty:
-        sp = spy_df.copy()
+        # Normalise SPY dataframe in the same way as the main history.  This
+        # ensures a 'Datetime' column exists if possible.  The SPY data may
+        # arrive with a DatetimeIndex, in which case _ensure_datetime_column
+        # resets it to a column for consistency.
+        sp = _ensure_datetime_column(spy_df.copy())
         if "Datetime" in sp.columns:
             sp["Datetime"] = pd.to_datetime(sp["Datetime"], errors="coerce", utc=True)
             sp = sp.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
-        sp_close = pd.to_numeric(sp["Close"], errors="coerce")
+        elif isinstance(sp.index, pd.DatetimeIndex):
+            # Already a DatetimeIndex after normalisation – just sort
+            sp = sp.sort_index()
+        # Safely coerce close prices to numeric
+        sp_close = pd.to_numeric(sp.get("Close", pd.Series(dtype=float)), errors="coerce")
         # замерване на относителна доходност за същия прозорец
         ret_sym = close.pct_change(20)
         ret_spy = sp_close.pct_change(20).reindex_like(ret_sym).ffill()
@@ -554,6 +569,20 @@ def trading_console(state: Dict[str, Any]):
     for tkr in st.session_state['console_tickers']:
         st.markdown(f"### {tkr}")
         hist = st.session_state['console_history'].get(tkr)
+        # Normalise the stored history so that a 'Datetime' column exists.  This
+        # is necessary for downstream plotting and metric computation.  The
+        # `_ensure_datetime_column` helper returns a new dataframe if a rename
+        # or reset_index was needed.  Update the session state so that future
+        # operations see the normalised version.
+        if hist is not None and not getattr(hist, 'empty', False):
+            try:
+                new_hist = _ensure_datetime_column(hist)
+                # Only replace the session copy if a modification occurred
+                if new_hist is not hist:
+                    st.session_state['console_history'][tkr] = new_hist
+                    hist = new_hist
+            except Exception:
+                pass
 
         # ако нямаме 20 точки – показваме бутон Seed last 1D
         if hist is None or hist.empty or len(hist) < 20:
