@@ -61,6 +61,65 @@ TICKER_SUGGESTIONS: Dict[str, str] = {
     "ETH-USD": "Ethereum USD"
 }
 
+# -----------------------------------------------------------------------------
+# Date/time helpers
+#
+# In many parts of the code we work with DataFrames that may or may not contain
+# a "Datetime" column.  Some functions assume this column exists and is named
+# exactly "Datetime".  However, depending on how the data was constructed,
+# sometimes the first column is called "index" (after a reset_index call) or the
+# datetime information lives in the index itself.  To make downstream code
+# robust, we normalize any incoming dataframe to always have a "Datetime"
+# column.  If the index is a DatetimeIndex we reset it, rename the resulting
+# first column to "Datetime" and return.  If "Datetime" isn't in the columns
+# and the index isn't a DatetimeIndex, we simply rename the first existing
+# column to "Datetime".  This helper leaves the original dataframe unmodified
+# and returns a copy.
+def _ensure_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure that the provided DataFrame has a 'Datetime' column.
+
+    This function tries to make a best effort to surface any datetime
+    information into a column named 'Datetime'.  If the dataframe already
+    contains a 'Datetime' column, it is returned unchanged.  If the index
+    is a DatetimeIndex, the index is reset and the first column is renamed
+    to 'Datetime'.  Otherwise, if at least one column exists, the first
+    column is renamed to 'Datetime'.  If the dataframe is empty or None,
+    it is returned as-is.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame that may or may not contain a 'Datetime' column.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of the input dataframe guaranteed to have a 'Datetime' column.
+    """
+    try:
+        # If df is None or empty return it directly
+        if df is None or getattr(df, 'empty', False):
+            return df
+        # Already has 'Datetime' column
+        if 'Datetime' in df.columns:
+            return df.copy()
+        # If index is DatetimeIndex, reset it and rename first column
+        if isinstance(df.index, pd.DatetimeIndex):
+            df2 = df.reset_index()
+            # rename index column
+            if df2.columns.size:
+                df2 = df2.rename(columns={df2.columns[0]: 'Datetime'})
+            return df2
+        # Otherwise rename the first column if exists
+        if len(df.columns) > 0:
+            df2 = df.copy()
+            first = df2.columns[0]
+            df2 = df2.rename(columns={first: 'Datetime'})
+            return df2
+    except Exception:
+        pass
+    return df
+
 def _search_ticker_local(query: str, max_results: int = 5) -> List[Tuple[str, str]]:
     """Return a list of (ticker, name) pairs matching a query from the static
     suggestions list.  Matching is case-insensitive and checks both ticker
