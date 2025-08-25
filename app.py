@@ -291,6 +291,30 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     high = df["High"]
     low  = df["Low"]
     vol  = df["Volume"]
+    # Ensure that close/high/low/vol are one‑dimensional Series.  In some edge cases
+    # df[c] may be a scalar or a DataFrame column-like object that is not a Series,
+    # which breaks downstream functions.  Wrapping in pd.Series guarantees a
+    # 1‑d structure without changing existing Series.
+    try:
+        if not isinstance(close, pd.Series):
+            close = pd.Series(close)
+    except Exception:
+        close = pd.Series(close)
+    try:
+        if not isinstance(high, pd.Series):
+            high = pd.Series(high)
+    except Exception:
+        high = pd.Series(high)
+    try:
+        if not isinstance(low, pd.Series):
+            low = pd.Series(low)
+    except Exception:
+        low = pd.Series(low)
+    try:
+        if not isinstance(vol, pd.Series):
+            vol = pd.Series(vol)
+    except Exception:
+        vol = pd.Series(vol)
 
     price = _lastf(close)
     first = _lastf(close.iloc[[0]])
