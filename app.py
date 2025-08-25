@@ -216,57 +216,46 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     BUY FLAGS: rel_ok, macd_ok, breakout_vol_ok/near_high, vol_ok_simple, spy_regime_ok, buy_guard_ok
     SELL FLAGS: rel_neg, macd_neg, near_low, high_volume_down, spy_regime_weak, sell_guard_ok
     """
-    # Work on a copy of the history and normalise the datetime column.  In
-    # practice hist may have the timestamp as an index or a column under a
-    # different name (e.g. 'index' after reset_index).  Normalising it
-    # early guarantees the rest of the logic always sees a 'Datetime'
-    # column to work with.  See `_ensure_datetime_column` for details.
+    #
+    # Normalize and prepare the intraday history.  Many downstream
+    # calculations (RSI, ATR, Bollinger Bands) assume a uniformly
+    # indexed DataFrame with numeric OHLCV columns and a valid
+    # Datetime index.  If the provided history does not conform (for
+    # example, the timestamp lives in a column called 'index' or the
+    # columns contain list-like values), this logic coerces the data into
+    # a consistent shape.  Any rows with invalid or missing datetimes
+    # are dropped.  We also ensure that all O/H/L columns exist and
+    # propagate the Close values to them if missing.
     df = _ensure_datetime_column(hist.copy())
-
-    # --- индекс и типове ---
-    # Convert the datetime column to UTC and set it as index.  If there is
-    # still no 'Datetime' column at this point (unlikely because of
-    # _ensure_datetime_column), fall back to sorting the existing index if
-    # it is a DatetimeIndex.  Otherwise leave as-is.
+    # Convert Datetime column to timezone-aware UTC
     if "Datetime" in df.columns:
-        # Convert to datetime (UTC) and safely filter out NaT values without raising KeyError
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
-        # Some dataframes may lose the column after conversion; re-check before filtering
-        if "Datetime" in df.columns:
-            # Filter rows where Datetime is not NaT and sort
-            df = df[df["Datetime"].notna()]
-            df = df.sort_values("Datetime")
-            df = df.set_index("Datetime")
-        elif isinstance(df.index, pd.DatetimeIndex):
-            # Fall back to sorting by index if column disappeared
-            df = df.sort_index()
+        # Drop rows without valid datetime
+        df = df.dropna(subset=["Datetime"]).sort_values("Datetime")
+        df = df.set_index("Datetime")
     else:
-        try:
-            if isinstance(df.index, pd.DatetimeIndex):
-                df = df.sort_index()
-        except Exception:
-            pass
-    # числови колони
+        # Fallback: if index is a DatetimeIndex, sort by index
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.sort_index()
+        else:
+            # Cannot proceed if no datetime information
+            df = pd.DataFrame()
+    # Ensure numeric conversion for OHLCV columns.  We first try a direct
+    # numeric conversion; if the values are list-like (e.g. each entry is
+    # a list or tuple), take the first element.  Any conversion errors
+    # result in NaN which is later handled via dropna/rolling ops.
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
-            try:
-                # Convert the column to numeric values.  If the column contains list-like
-                # data this will coerce each element; if the column is a scalar or
-                # otherwise non-iterable, this may raise a TypeError.
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            except TypeError:
-                try:
-                    # Handle the case where df[c] is a scalar or unsupported type.
-                    # Repeat the value across the length of the dataframe and coerce.
-                    val = df[c]
-                    # Determine how many rows to repeat; if df is DataFrame use its length
-                    nrows = len(df) if isinstance(df, pd.DataFrame) else 1
-                    df[c] = pd.to_numeric(pd.Series([val] * nrows), errors="coerce")
-                except Exception:
-                    # As a last resort, leave the column unchanged
-                    pass
-
-    # ако липсват O/H/L, ги приравняваме към Close (за да работят ATR/BB)
+            # Extract scalar values if lists/tuples/arrays are present
+            col = df[c]
+            # Convert each element to a scalar when possible
+            def _to_scalar(x):
+                if isinstance(x, (list, tuple, np.ndarray)):
+                    return x[0] if len(x) else np.nan
+                return x
+            col_vals = col.apply(_to_scalar)
+            df[c] = pd.to_numeric(col_vals, errors="coerce")
+    # Fill missing OHLC columns from Close
     if "Close" not in df.columns:
         raise ValueError("History missing 'Close' column.")
     for c in ["Open", "High", "Low"]:
@@ -274,12 +263,12 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
             df[c] = df["Close"]
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
-
-    # нужни точки
+    # Remove rows without a close price
+    df = df.dropna(subset=["Close"])
+    # If fewer than two data points remain, we cannot compute intraday metrics
     n = len(df)
     if n < 2:
-        # няма какво да смятаме
-        price = _lastf(df["Close"])
+        price = _lastf(df["Close"]) if not df.empty else None
         return (
             {"price": price, "delta_pct": None},
             {"buy_guard_ok": False, "spy_regime_ok": True},
