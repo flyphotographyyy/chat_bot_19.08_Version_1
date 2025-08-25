@@ -715,14 +715,14 @@ def get_price_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.
             except Exception:
                 pass
         
-# Ensure Datetime index normalization for consistent downstream usage
-try:
-    if isinstance(data.index, pd.DatetimeIndex):
-        data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
-        data.index.name = "Datetime"
-except Exception:
-    pass
-_price_cache[key] = data.copy()
+        # Ensure Datetime index normalization for consistent downstream usage
+        try:
+            if isinstance(data.index, pd.DatetimeIndex):
+                data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
+                data.index.name = "Datetime"
+        except Exception:
+            pass
+        _price_cache[key] = data.copy()
         return data
     except Exception:
         return pd.DataFrame()
