@@ -537,16 +537,15 @@ def trading_console(state: Dict[str, Any]):
         st.markdown("### 🔄 Auto price update")
         if st.button("Refresh from API now"):
             for tkr in st.session_state['console_tickers']:
-                try:
-                    df = get_price_data(tkr, period="5d", interval="1m")
-                    if df is not None and not df.empty:
-                        df = df.reset_index()
-                        
-                        if "Datetime" not in df.columns:
-                            df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
-    st.session_state['console_history'][tkr] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-                except Exception:
-                    st.warning(f"Failed to refresh {tkr}")
+                    try:
+                        df = get_price_data(tkr, period="5d", interval="1m")
+                        if df is not None and not df.empty:
+                            df = df.reset_index()
+                            if "Datetime" not in df.columns:
+                                df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
+                            st.session_state['console_history'][tkr] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                    except Exception:
+                        st.warning(f"Failed to refresh {tkr}")
             st.success("Data refreshed from API")
 
     st.markdown("---")
