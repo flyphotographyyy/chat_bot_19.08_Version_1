@@ -226,13 +226,31 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     # a consistent shape.  Any rows with invalid or missing datetimes
     # are dropped.  We also ensure that all O/H/L columns exist and
     # propagate the Close values to them if missing.
-    df = _ensure_datetime_column(hist.copy())
+    # Defensive copy: hist may not always be a DataFrame (e.g. None or Series).  If copy
+    # fails, fallback to an empty DataFrame which will trigger the "not enough
+    # data" path below.
+    try:
+        df = _ensure_datetime_column(hist.copy())
+    except Exception:
+        df = pd.DataFrame()
     # Convert Datetime column to timezone-aware UTC
     if "Datetime" in df.columns:
+        # Convert to timezone-aware UTC
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
-        # Drop rows without valid datetime
-        df = df.dropna(subset=["Datetime"]).sort_values("Datetime")
-        df = df.set_index("Datetime")
+        # Drop NaT datetimes and sort
+        try:
+            df = df.dropna(subset=["Datetime"]).sort_values("Datetime")
+            df = df.set_index("Datetime")
+        except KeyError:
+            # In rare cases the Datetime column may be missing despite the
+            # earlier check (for example, hist is a view that loses the column
+            # after assignment).  Fallback to sorting by index if it is a
+            # DatetimeIndex; otherwise mark df empty so the caller can
+            # gracefully handle the lack of data.
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.sort_index()
+            else:
+                df = pd.DataFrame()
     else:
         # Fallback: if index is a DatetimeIndex, sort by index
         if isinstance(df.index, pd.DatetimeIndex):
