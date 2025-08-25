@@ -163,6 +163,14 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     if "Datetime" in df.columns:
         df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True)
         df = df.dropna(subset=["Datetime"]).sort_values("Datetime").set_index("Datetime")
+
+    else:
+        # If the index is already a DatetimeIndex, just sort by index
+        try:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.sort_index()
+        except Exception:
+            pass
     # числови колони
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
@@ -371,7 +379,10 @@ def intraday_backtest(ticker: str, days: int = 20, interval: str = "1m") -> Dict
         if df is None or df.empty:
             return {}
         df = df.reset_index()
-        closes = df['Close'].astype(float)
+        
+                        if "Datetime" not in df.columns:
+                            df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
+    closes = df['Close'].astype(float)
         highs = df['High'].astype(float) if 'High' in df.columns else closes
         lows = df['Low'].astype(float) if 'Low' in df.columns else closes
         vols = df['Volume'].astype(float) if 'Volume' in df.columns else None
@@ -531,7 +542,10 @@ def trading_console(state: Dict[str, Any]):
                     df = get_price_data(tkr, period="5d", interval="1m")
                     if df is not None and not df.empty:
                         df = df.reset_index()
-                        st.session_state['console_history'][tkr] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                        
+                        if "Datetime" not in df.columns:
+                            df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
+    st.session_state['console_history'][tkr] = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
                 except Exception:
                     st.warning(f"Failed to refresh {tkr}")
             st.success("Data refreshed from API")
@@ -702,7 +716,15 @@ def get_price_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.
                 data[['Open', 'High', 'Low', 'Close']] = data[['Open', 'High', 'Low', 'Close']].mul(ratio, axis=0)
             except Exception:
                 pass
-        _price_cache[key] = data.copy()
+        
+# Ensure Datetime index normalization for consistent downstream usage
+try:
+    if isinstance(data.index, pd.DatetimeIndex):
+        data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
+        data.index.name = "Datetime"
+except Exception:
+    pass
+_price_cache[key] = data.copy()
         return data
     except Exception:
         return pd.DataFrame()
@@ -965,7 +987,11 @@ def seed_last_session_into_session(ticker: str, min_points: int = MIN_INTRADAY_P
             return False, "No intraday data from yfinance."
 
         dfr = df.reset_index()
-        st.session_state.setdefault("console_history", {})
+        
+        if "Datetime" not in dfr.columns:
+            # rename the first column created by reset_index (often 'index' or None)
+            dfr.rename(columns={dfr.columns[0]: "Datetime"}, inplace=True)
+    st.session_state.setdefault("console_history", {})
         st.session_state["console_history"][ticker] = dfr[["Datetime", "Open", "High", "Low", "Close", "Volume"]].copy()
         return True, f"Seeded {len(dfr)} bars for {ticker}."
     except Exception as e:
