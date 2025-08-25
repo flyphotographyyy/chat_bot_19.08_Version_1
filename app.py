@@ -989,7 +989,7 @@ def seed_last_session_into_session(ticker: str, min_points: int = MIN_INTRADAY_P
         if "Datetime" not in dfr.columns:
             # rename the first column created by reset_index (often 'index' or None)
             dfr.rename(columns={dfr.columns[0]: "Datetime"}, inplace=True)
-    st.session_state.setdefault("console_history", {})
+        st.session_state.setdefault("console_history", {})
         st.session_state["console_history"][ticker] = dfr[["Datetime", "Open", "High", "Low", "Close", "Volume"]].copy()
         return True, f"Seeded {len(dfr)} bars for {ticker}."
     except Exception as e:
