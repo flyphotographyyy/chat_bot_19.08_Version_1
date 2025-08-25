@@ -249,7 +249,22 @@ def compute_intraday_metrics(hist: pd.DataFrame, spy_df: pd.DataFrame | None = N
     # числови колони
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            try:
+                # Convert the column to numeric values.  If the column contains list-like
+                # data this will coerce each element; if the column is a scalar or
+                # otherwise non-iterable, this may raise a TypeError.
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            except TypeError:
+                try:
+                    # Handle the case where df[c] is a scalar or unsupported type.
+                    # Repeat the value across the length of the dataframe and coerce.
+                    val = df[c]
+                    # Determine how many rows to repeat; if df is DataFrame use its length
+                    nrows = len(df) if isinstance(df, pd.DataFrame) else 1
+                    df[c] = pd.to_numeric(pd.Series([val] * nrows), errors="coerce")
+                except Exception:
+                    # As a last resort, leave the column unchanged
+                    pass
 
     # ако липсват O/H/L, ги приравняваме към Close (за да работят ATR/BB)
     if "Close" not in df.columns:
