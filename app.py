@@ -379,10 +379,9 @@ def intraday_backtest(ticker: str, days: int = 20, interval: str = "1m") -> Dict
         if df is None or df.empty:
             return {}
         df = df.reset_index()
-        
-                        if "Datetime" not in df.columns:
-                            df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
-    closes = df['Close'].astype(float)
+        if "Datetime" not in df.columns:
+            df.rename(columns={df.columns[0]: "Datetime"}, inplace=True)
+        closes = df['Close'].astype(float)
         highs = df['High'].astype(float) if 'High' in df.columns else closes
         lows = df['Low'].astype(float) if 'Low' in df.columns else closes
         vols = df['Volume'].astype(float) if 'Volume' in df.columns else None
