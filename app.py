@@ -34,6 +34,136 @@ except Exception:
     yf = None
 
 # -----------------------------------------------------------------------------
+# Alpaca Live Data support (optional)
+#
+# To enable real‑time price updates via Alpaca, set the environment variables
+# ALPACA_API_KEY and ALPACA_API_SECRET to your Alpaca API credentials.  If the
+# alpaca‑py library is installed (pip install alpaca-py), the code below will
+# establish a WebSocket connection and update session state with live prices.
+#
+# When live mode is enabled via the sidebar toggle, the app subscribes to
+# trades for all tickers in the watchlist and console.  On each trade event
+# the current price is stored in st.session_state['live_prices'] and a new
+# timestamped row is appended to st.session_state['console_history'][symbol].
+try:
+    from alpaca.data.live import StockDataStream
+except Exception:
+    StockDataStream = None  # Alpaca library not installed
+import threading
+
+# Fetch Alpaca API credentials from environment.  Users should set these via
+# os.environ or in a .env file before running the app.  Without valid keys or
+# the alpaca-py library, live mode will show an informational message.
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+
+# Global variables holding the active stream and thread, if any.  We also keep
+# a set of currently subscribed symbols to avoid duplicate subscriptions.
+alpaca_stream = None
+alpaca_thread = None
+_live_subscribed: set[str] = set()
+
+def _live_trade_callback(data) -> None:
+    """Callback invoked for each trade event from Alpaca.
+
+    Updates live price and console history in session_state and triggers a
+    rerun to reflect the new price on screen.  This function is called
+    asynchronously from the WebSocket thread.
+    """
+    try:
+        sym = getattr(data, "symbol", None)
+        price = getattr(data, "price", None)
+        if not sym or price is None:
+            return
+        sym = sym.upper()
+        # Store latest price
+        st.session_state.setdefault('live_prices', {})[sym] = float(price)
+        # Append to console history if present
+        try:
+            ts = datetime.utcnow()
+            row = pd.DataFrame({'Datetime': [ts], 'Close': [float(price)]})
+            hist = st.session_state.get('console_history', {}).get(sym)
+            if hist is None or getattr(hist, 'empty', False):
+                new_hist = row
+            else:
+                new_hist = pd.concat([hist, row], ignore_index=True)
+            st.session_state.setdefault('console_history', {})[sym] = new_hist
+        except Exception:
+            pass
+        # Mark last update time.  The UI can use this to trigger auto refresh.
+        st.session_state['last_live_update'] = time.time()
+        # Trigger a rerun to update the UI.  Streamlit 1.30+ exposes st.rerun.
+        try:
+            st.rerun()
+        except RuntimeError:
+            # In case we're not in a rerunnable context, ignore.
+            pass
+    except Exception:
+        pass
+
+def _start_live_feed(symbols: List[str]) -> None:
+    """Ensure a live feed is running and subscribed to the given symbols.
+
+    If the alpaca library is unavailable or credentials are missing, the
+    function returns immediately.  Otherwise, it creates a StockDataStream
+    client, subscribes to trade updates for each symbol (adding new
+    subscriptions as symbols are added), and runs the stream in a background
+    daemon thread.  Symbols should be uppercase.
+    """
+    global alpaca_stream, alpaca_thread, _live_subscribed
+    # No live functionality if alpaca‑py is missing or keys are unset
+    if StockDataStream is None or not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        return
+    # Normalise symbols list
+    syms = [s.upper() for s in symbols if s]
+    if not syms:
+        return
+    # If stream already running, subscribe to any new symbols
+    if alpaca_stream is not None:
+        for s in syms:
+            if s not in _live_subscribed:
+                try:
+                    alpaca_stream.subscribe_trades(_live_trade_callback, s)
+                    _live_subscribed.add(s)
+                except Exception:
+                    pass
+        return
+    # Create a new stream client and subscribe to all symbols
+    try:
+        stream = StockDataStream(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET)
+    except Exception:
+        return
+    # Subscribe to each symbol
+    for s in syms:
+        try:
+            stream.subscribe_trades(_live_trade_callback, s)
+            _live_subscribed.add(s)
+        except Exception:
+            pass
+    # Launch the stream in a background thread
+    def _runner():
+        try:
+            stream.run()
+        except Exception:
+            pass
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    alpaca_stream = stream
+    alpaca_thread = t
+
+def _stop_live_feed() -> None:
+    """Stop and clean up the live feed if running."""
+    global alpaca_stream, alpaca_thread, _live_subscribed
+    if alpaca_stream is not None:
+        try:
+            alpaca_stream.stop()
+        except Exception:
+            pass
+    alpaca_stream = None
+    alpaca_thread = None
+    _live_subscribed.clear()
+
+# -----------------------------------------------------------------------------
 # Trading Console helpers and suggestions
 #
 # To provide ticker suggestions without relying on a network call at runtime,
@@ -612,6 +742,12 @@ def trading_console(state: Dict[str, Any]):
                 sym = pick.split(" – ")[0].strip().upper()
                 if sym and sym not in st.session_state['console_tickers']:
                     st.session_state['console_tickers'].append(sym)
+                    # If live mode is on, subscribe the new symbol immediately
+                    try:
+                        if st.session_state.get("live_mode", False):
+                            _start_live_feed([sym])
+                    except Exception:
+                        pass
                     st.success(f"Added {sym}")
         else:
             st.caption("No suggestions found.")
@@ -622,6 +758,12 @@ def trading_console(state: Dict[str, Any]):
         if sym:
             if sym not in st.session_state['console_tickers']:
                 st.session_state['console_tickers'].append(sym)
+                # Subscribe new symbol in live mode
+                try:
+                    if st.session_state.get("live_mode", False):
+                        _start_live_feed([sym])
+                except Exception:
+                    pass
                 st.success(f"Added {sym}")
             else:
                 st.info(f"{sym} already in console")
@@ -3085,6 +3227,27 @@ if go is None:
 # Load persisted state (needed for defaults in the sidebar)
 state = load_watchlist()
 
+# If live mode is enabled (from a previous session), ensure the Alpaca feed
+# is running and subscribed to current tickers.  This call is idempotent: if
+# the feed is already active it will only subscribe new symbols.  Symbols
+# include both watchlist tickers and console tickers.  No action is taken
+# if the alpaca library or credentials are missing.
+try:
+    if st.session_state.get("live_mode", False):
+        syms: List[str] = []
+        try:
+            syms += state.get("tickers", [])
+        except Exception:
+            pass
+        try:
+            syms += st.session_state.get("console_tickers", [])
+        except Exception:
+            pass
+        if syms:
+            _start_live_feed(syms)
+except Exception:
+    pass
+
 # -------- Sidebar (define `page` BEFORE using it) --------
 with st.sidebar:
     # Navigation
@@ -3116,6 +3279,12 @@ with st.sidebar:
             merged = sorted(list(set(state.get("tickers", []) + new)))
             state["tickers"] = merged
             save_watchlist(state)
+            # Subscribe new tickers in live mode
+            try:
+                if st.session_state.get("live_mode", False):
+                    _start_live_feed(new)
+            except Exception:
+                pass
             st.success(f"Added: {', '.join(new)}")
 
     current = state.get("tickers", [])
@@ -3155,6 +3324,41 @@ with st.sidebar:
 
     # Manual refresh button
     if st.button("🔄 Refresh now"):
+        st.rerun()
+
+    # -----------------------------------------------------------------------
+    # Live mode toggle
+    # When enabled, the app will stream real‑time prices from Alpaca (if
+    # available) and update the watchlist and console automatically.  This
+    # requires the alpaca‑py library and valid API credentials (see docs at
+    # https://alpaca.markets/ for free keys).  New tickers are automatically
+    # subscribed.  Disable to revert to on‑demand refresh.  The current
+    # setting is stored in st.session_state["live_mode"].
+    live_default = bool(st.session_state.get("live_mode", False))
+    live_mode = st.checkbox(
+        "🔴 Live mode (Alpaca)",
+        value=live_default,
+        help="Stream real‑time prices using Alpaca. Requires API keys in the environment."
+    )
+    # React to toggle changes.  When toggled on, start or update the live feed
+    # with all current watchlist and console tickers.  When toggled off,
+    # stop the feed.  A rerun ensures the UI reflects the new mode.
+    if live_mode != live_default:
+        st.session_state["live_mode"] = live_mode
+        if live_mode:
+            # Determine current symbols to subscribe
+            syms = []
+            try:
+                syms += state.get("tickers", [])
+            except Exception:
+                pass
+            try:
+                syms += st.session_state.get("console_tickers", [])
+            except Exception:
+                pass
+            _start_live_feed(syms)
+        else:
+            _stop_live_feed()
         st.rerun()
 
     # Auto-refresh (only on Watchlist page)
@@ -3258,6 +3462,21 @@ for r in results:
         "Days→Earn": m.get("days_to_earnings"),
         "IBKR Δ%": m.get("ibkr_delta_pct"),
     })
+
+# If live prices are available, override the Price column with the latest
+# value from Alpaca.  This ensures the watchlist reflects real‑time updates
+# when live mode is enabled.  We update the 'rows' list directly and
+# recreate the DataFrame afterwards.
+try:
+    lp = st.session_state.get("live_prices")
+    if lp:
+        for row in rows:
+            sym = row.get("Ticker")
+            if sym and sym.upper() in lp:
+                # update price with latest live price
+                row["Price"] = lp[sym.upper()]
+except Exception:
+    pass
 
 summary_df = pd.DataFrame(rows)
 numeric_scores = [r.get("score", 0) for r in results if not r.get("error")]
