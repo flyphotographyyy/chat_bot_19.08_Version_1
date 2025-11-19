@@ -18,3 +18,5 @@ python-slugify==8.0.4
 setuptools>=70
 wheel>=0.43
 
+alpaca-py
+
