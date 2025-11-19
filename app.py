@@ -3375,6 +3375,22 @@ with st.sidebar:
         value=live_default,
         help="Stream real‑time prices using Alpaca. Requires API keys in the environment."
     )
+    # ------------------------------
+    # 🔍 DEBUG: Alba Live Status
+    # ------------------------------
+   st.write("### 🛠️ Live Debug Info")
+   st.code(f"""
+   StockDataStream: {'OK' if StockDataStream else 'MISSING'}
+   API_KEY:        {'SET' if bool(ALPACA_API_KEY) else 'MISSING'}
+   API_SECRET:     {'SET' if bool(ALPACA_API_SECRET) else 'MISSING'}
+
+   stream_running: {'YES' if alpaca_stream else 'NO'}
+   subscribed:     {list(_live_subscribed)}
+
+   live_prices:    {st.session_state.get('live_prices', {})}
+   last_update:    {st.session_state.get('last_live_update', None)}
+   """)
+
 
     # Provide feedback if live mode cannot be used.  We render a small
     # informational message below the checkbox whenever the Alpaca
