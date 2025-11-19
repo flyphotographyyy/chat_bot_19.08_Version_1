@@ -3049,9 +3049,30 @@ def save_watchlist(state: Dict[str, Any]) -> None:
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-# Gate: Supabase auth first
-if not _auth_gate():
-    st.stop()
+# ---------------------------------------------------------------------------
+# Automatic login bypass
+#
+# The original application requires users to create a profile and sign in via
+# Supabase before they can access the main interface.  For certain use cases
+# (e.g. local/offline use or quick testing), this requirement can be
+# inconvenient.  To support a "guest" mode, we initialise a default
+# authenticated session state here and skip the authentication gate below.
+# This preserves the existing authentication logic (available via the
+# `_auth_gate` function) without invoking it.  We also populate
+# `auth_ok`, `auth_user` and `auth_uid` to mimic a logged‑in user so that
+# downstream functions (e.g. loading/saving watchlists) continue to work.
+if "auth_ok" not in st.session_state:
+    st.session_state["auth_ok"] = True
+    st.session_state["auth_user"] = "guest"
+    # use a fixed ID to allow persistence across reruns; this does not
+    # correspond to any real Supabase user and is used only locally
+    st.session_state["auth_uid"] = "local_guest"
+
+# Note: We deliberately avoid calling `_auth_gate()` to remove the
+# login/register requirement.  Should you wish to restore authentication,
+# comment out the block above and uncomment the lines below.
+# if not _auth_gate():
+#     st.stop()
 
 # Guards for missing libs
 if yf is None:
