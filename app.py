@@ -3378,8 +3378,8 @@ with st.sidebar:
     # ------------------------------
     # 🔍 DEBUG: Alba Live Status
     # ------------------------------
-   st.write("### 🛠️ Live Debug Info")
-   st.code(f"""
+    st.write("### 🛠️ Live Debug Info")
+    st.code(f"""
    StockDataStream: {'OK' if StockDataStream else 'MISSING'}
    API_KEY:        {'SET' if bool(ALPACA_API_KEY) else 'MISSING'}
    API_SECRET:     {'SET' if bool(ALPACA_API_SECRET) else 'MISSING'}
