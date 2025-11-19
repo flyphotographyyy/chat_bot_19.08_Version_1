@@ -46,9 +46,22 @@ except Exception:
 # the current price is stored in st.session_state['live_prices'] and a new
 # timestamped row is appended to st.session_state['console_history'][symbol].
 try:
+    # Alpaca WebSocket client for live data.  In newer versions this module
+    # exposes a DataFeed enum which allows selecting between IEX (free) and
+    # SIP (premium) feeds.  We import both the stream client and the enum
+    # here and handle missing imports gracefully.  See docs for details:
+    # https://alpaca.markets/sdks/python/api_reference/data/stock/live.html
     from alpaca.data.live import StockDataStream
+    try:
+        # DataFeed enum is defined at top‑level in alpaca.data
+        from alpaca.data import DataFeed  # type: ignore
+    except Exception:
+        DataFeed = None  # Older alpaca‑py versions may not expose DataFeed
 except Exception:
-    StockDataStream = None  # Alpaca library not installed
+    # If alpaca‑py is not installed we set these to None so the code can
+    # gracefully fall back to no‑live mode.
+    StockDataStream = None
+    DataFeed = None
 import threading
 
 # Fetch Alpaca API credentials from environment.  Users should set these via
@@ -63,12 +76,18 @@ alpaca_stream = None
 alpaca_thread = None
 _live_subscribed: set[str] = set()
 
-def _live_trade_callback(data) -> None:
-    """Callback invoked for each trade event from Alpaca.
+async def _live_trade_callback(data) -> None:
+    """Async callback invoked for each trade event from Alpaca.
 
-    Updates live price and console history in session_state and triggers a
-    rerun to reflect the new price on screen.  This function is called
-    asynchronously from the WebSocket thread.
+    This handler is declared as ``async`` because the official alpaca‑py
+    streaming API expects coroutine callbacks【480609643280105†L291-L313】.  When a trade update
+    arrives we update ``st.session_state`` with the latest price and
+    append a timestamped row to the console history.  We also record
+    ``last_live_update`` so the main UI can poll for changes.  A call to
+    ``st.rerun()`` is wrapped in a try/except: Streamlit will ignore
+    rerun requests from background threads if not in a rerunnable
+    context.  Should this fail, the auto‑refresh timer on the Watchlist
+    will pick up the updated price.
     """
     try:
         sym = getattr(data, "symbol", None)
@@ -92,13 +111,15 @@ def _live_trade_callback(data) -> None:
             pass
         # Mark last update time.  The UI can use this to trigger auto refresh.
         st.session_state['last_live_update'] = time.time()
-        # Trigger a rerun to update the UI.  Streamlit 1.30+ exposes st.rerun.
+        # Trigger a rerun to update the UI.  In Streamlit 1.30+ st.rerun()
+        # replaces st.experimental_rerun().  If called from a non‑main
+        # thread this may raise RuntimeError; ignore in that case.
         try:
             st.rerun()
         except RuntimeError:
-            # In case we're not in a rerunnable context, ignore.
             pass
     except Exception:
+        # Silently ignore malformed data or other errors
         pass
 
 def _start_live_feed(symbols: List[str]) -> None:
@@ -128,9 +149,23 @@ def _start_live_feed(symbols: List[str]) -> None:
                 except Exception:
                     pass
         return
-    # Create a new stream client and subscribe to all symbols
+    # Create a new stream client and subscribe to all symbols.  We allow
+    # overriding the feed via an environment variable ``ALPACA_FEED``.  The
+    # DataFeed enum is optional (may be None on older alpaca‑py) so we
+    # gracefully fall back to the default feed if unavailable.  Valid values
+    # for ALPACA_FEED are "IEX" (free) or "SIP" (premium).  See docs for
+    # details【616177955719274†L132-L136】.  If DataFeed is not available we simply omit the feed.
     try:
-        stream = StockDataStream(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET)
+        if DataFeed is not None:
+            feed_env = os.getenv("ALPACA_FEED", "IEX").upper()
+            if feed_env == "SIP":
+                chosen_feed = DataFeed.SIP
+            else:
+                # default to IEX
+                chosen_feed = DataFeed.IEX
+            stream = StockDataStream(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET, feed=chosen_feed)
+        else:
+            stream = StockDataStream(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET)
     except Exception:
         return
     # Subscribe to each symbol
@@ -3340,6 +3375,16 @@ with st.sidebar:
         value=live_default,
         help="Stream real‑time prices using Alpaca. Requires API keys in the environment."
     )
+
+    # Provide feedback if live mode cannot be used.  We render a small
+    # informational message below the checkbox whenever the Alpaca
+    # streaming client is unavailable or the user has not set API
+    # credentials.  This helps users understand why enabling the
+    # checkbox has no effect rather than silently failing.
+    if StockDataStream is None:
+        st.info("Live mode unavailable: the alpaca‑py library is not installed.")
+    elif not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        st.info("Live mode disabled: please set ALPACA_API_KEY and ALPACA_API_SECRET environment variables.")
     # React to toggle changes.  When toggled on, start or update the live feed
     # with all current watchlist and console tickers.  When toggled off,
     # stop the feed.  A rerun ensures the UI reflects the new mode.
