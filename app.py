@@ -3078,6 +3078,326 @@ def build_chart(df: pd.DataFrame, title: str, sl: float | None = None, tp: float
                       height=520, legend_orientation="h", margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
+# ---------------------------------------------------------------------
+# Fast technical analysis for Live mode
+# In live mode we avoid expensive calls (fundamentals, ML, macro) and compute
+# only basic technical indicators to derive a simplified score and signal.
+# This function uses cached daily price history and computes a subset of the
+# metrics from ``analyze_ticker``.  It returns a dictionary in the same format
+# as ``analyze_ticker`` with omitted fields set to None.  Scoring uses a
+# lightweight heuristic: positive trend, rising moving averages, momentum and
+# volume breakout contribute positively; extended or volatile conditions
+# subtract from the score.  The thresholds for buy/sell signals come from
+# ``PROFILE_CONFIG`` based on the selected risk profile.
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def analyze_ticker_fast(
+    ticker: str,
+    profile: str,
+    optional_ibkr_price: float | None = None,
+    spy_df: pd.DataFrame | None = None,
+) -> Dict[str, Any]:
+    """
+    Lightweight analysis suitable for live mode.  Computes only technical
+    indicators (SMA/EMA, RSI, MACD, ATR, volume surge, Bollinger bands) on
+    daily price history.  Fundamental metrics, ML predictions and macro
+    inputs are skipped to reduce latency.  Returns a result dict with
+    simplified metrics and a buy/hold/sell signal based on a numeric score.
+
+    Parameters
+    ----------
+    ticker : str
+        Stock symbol to analyse.
+    profile : str
+        Risk profile used to determine scoring thresholds.
+    optional_ibkr_price : float, optional
+        If provided, used to compute a percent difference against the latest
+        close price (shown in the IBKR Δ% column).
+    spy_df : pd.DataFrame, optional
+        Pre-fetched SPY OHLCV data.  If provided, a simple 20‑day relative
+        strength vs SPY is computed; otherwise this metric is omitted.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys similar to ``analyze_ticker``: ticker, error,
+        score, signal, metrics, explanations and df.
+    """
+    res: Dict[str, Any] = {
+        "ticker": ticker,
+        "error": None,
+        "explanations": [],
+        "score": 0.0,
+        "signal": "HOLD",
+        "metrics": {},
+        "df": None,
+    }
+    try:
+        raw = fetch_history(ticker)
+    except Exception:
+        raw = None
+    if raw is None or raw.empty:
+        res["error"] = "No data"
+        return res
+    try:
+        df = _extract_ohlcv_1d(raw)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        res["error"] = "No data"
+        return res
+    # compute basic series
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    vol = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(np.zeros(len(df)), index=df.index)
+    # simple metrics
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+    price = float(latest["Close"]) if not np.isnan(latest["Close"]) else None
+    change_pct = None
+    if len(df) > 1 and not np.isnan(latest["Close"]) and not np.isnan(prev["Close"]) and prev["Close"] != 0:
+        change_pct = (latest["Close"] / prev["Close"] - 1.0) * 100.0
+    # moving averages
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    # relative extension vs SMA50
+    ext_pct = None
+    if not np.isnan(sma50.iloc[-1]) and sma50.iloc[-1] != 0:
+        ext_pct = (price / sma50.iloc[-1] - 1.0) * 100.0
+    # RSI and MACD
+    rsi14 = rsi(close, 14)
+    macd_line, macd_signal, macd_hist = macd(close)
+    macd_ok = (_lastf(macd_line) is not None) and (_lastf(macd_signal) is not None) and (_lastf(macd_line) > _lastf(macd_signal))
+    macd_neg = (_lastf(macd_line) is not None) and (_lastf(macd_signal) is not None) and (_lastf(macd_line) < _lastf(macd_signal))
+    # ATR and volatility metrics
+    atr14 = atr(df, 14)
+    atr_pct = None
+    if price is not None and not np.isnan(price) and not np.isnan(atr14.iloc[-1]) and price != 0:
+        atr_pct = (atr14.iloc[-1] / price) * 100.0
+    # volume surge (Volume / 20-day average)
+    vol_avg20 = vol.rolling(20).mean()
+    vol_surge = None
+    if not np.isnan(vol_avg20.iloc[-1]) and vol_avg20.iloc[-1] != 0:
+        v_last = vol.iloc[-1]
+        va_last = vol_avg20.iloc[-1]
+        if not np.isnan(v_last) and not np.isnan(va_last) and va_last != 0:
+            vol_surge = v_last / va_last
+    # 20-day high/low
+    high20 = high.rolling(20).max()
+    low20 = low.rolling(20).min()
+    near_high = False
+    near_low = False
+    if price is not None and not np.isnan(price):
+        h20 = high20.iloc[-1] if not np.isnan(high20.iloc[-1]) else None
+        l20 = low20.iloc[-1] if not np.isnan(low20.iloc[-1]) else None
+        if h20 is not None and h20 != 0:
+            near_high = (h20 - price) / h20 <= 0.01
+        if l20 is not None and l20 != 0:
+            near_low = (price - l20) / l20 <= 0.01
+    # Bollinger band position and width
+    sma20 = close.rolling(20).mean()
+    bb_std = close.rolling(20).std(ddof=0)
+    bb_mid = sma20
+    bb_up = bb_mid + 2 * bb_std
+    bb_dn = bb_mid - 2 * bb_std
+    bb_width = bb_up - bb_dn
+    bb_pos = None
+    bb_width_pct = None
+    if bb_width.iloc[-1] is not None and not np.isnan(bb_width.iloc[-1]) and bb_width.iloc[-1] != 0:
+        bb_width_pct = (bb_width.iloc[-1] / bb_mid.iloc[-1] * 100.0) if (bb_mid.iloc[-1] and not np.isnan(bb_mid.iloc[-1])) else None
+        if not np.isnan(bb_up.iloc[-1]) and not np.isnan(bb_dn.iloc[-1]):
+            width_val = bb_up.iloc[-1] - bb_dn.iloc[-1]
+            if width_val != 0:
+                bb_pos = (price - bb_dn.iloc[-1]) / width_val if price is not None else None
+    # Slope of SMA50
+    slope50 = None
+    if len(sma50) >= 5 and not np.isnan(sma50.iloc[-1]) and not np.isnan(sma50.iloc[-5]):
+        slope50 = sma50.iloc[-1] - sma50.iloc[-5]
+    # Relative strength vs SPY (20-day)
+    rel20d_pp = None
+    spy_regime_ok = True
+    if spy_df is not None and not spy_df.empty and len(df) > 21 and len(spy_df) > 21:
+        try:
+            sp_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+            r_t = close.iloc[-1] / close.iloc[-21] - 1.0
+            r_s = sp_close.iloc[-1] / sp_close.iloc[-21] - 1.0
+            rel20d_pp = (r_t - r_s) * 100.0
+            # simple SPY regime: uptrend if 50d > 200d and RSI>45
+            sp50 = sp_close.rolling(50).mean()
+            sp200 = sp_close.rolling(200).mean()
+            sp_rsi = rsi(sp_close, 14)
+            spy_regime_ok = bool((_lastf(sp50) is not None and _lastf(sp200) is not None and _lastf(sp50) > _lastf(sp200) and (_lastf(sp_rsi) or 0) > 45))
+        except Exception:
+            rel20d_pp = None
+            spy_regime_ok = True
+    # Build metrics dictionary.  Fields unused in fast mode are left as None
+    metrics: Dict[str, Any] = {
+        "price": price,
+        "change_pct": change_pct,
+        "sma50": float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else None,
+        "sma200": float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else None,
+        "rsi14": float(rsi14.iloc[-1]) if not np.isnan(rsi14.iloc[-1]) else None,
+        "macd": float(macd_line.iloc[-1]) if not np.isnan(macd_line.iloc[-1]) else None,
+        "macd_signal": float(macd_signal.iloc[-1]) if not np.isnan(macd_signal.iloc[-1]) else None,
+        "macd_hist": float(macd_hist.iloc[-1]) if not np.isnan(macd_hist.iloc[-1]) else None,
+        "atr_pct": float(atr_pct) if atr_pct is not None and not np.isnan(atr_pct) else None,
+        "vol_surge": float(vol_surge) if vol_surge is not None and not np.isnan(vol_surge) else None,
+        "ext_pct": float(ext_pct) if ext_pct is not None and not np.isnan(ext_pct) else None,
+        "bb_pos": float(bb_pos) if bb_pos is not None and not np.isnan(bb_pos) else None,
+        "bb_width_pct": float(bb_width_pct) if bb_width_pct is not None and not np.isnan(bb_width_pct) else None,
+        "rel20d_pp": float(rel20d_pp) if rel20d_pp is not None and not np.isnan(rel20d_pp) else None,
+        "atr14": float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else None,
+        # placeholders for unused fields
+        "vol_avg20": None,
+        "high20": float(high20.iloc[-1]) if not np.isnan(high20.iloc[-1]) else None,
+        "low20": float(low20.iloc[-1]) if not np.isnan(low20.iloc[-1]) else None,
+        "pe_ratio": None,
+        "profit_margin_pct": None,
+        "roe_pct": None,
+        "backtest_win_rate_pct": None,
+        "backtest_avg_return_pct": None,
+        "backtest_signals": None,
+        "relSector20d_pp": None,
+        "gross_margin_pct": None,
+        "operating_margin_pct": None,
+        "ebitda_margin_pct": None,
+        "fcf_margin_pct": None,
+        "revenue_growth_pct": None,
+        "net_debt_ebitda": None,
+        "ml_prob_pct": None,
+        "ibkr_delta_pct": None,
+        "days_to_earnings": None,
+        "sl": None,
+        "tp": None,
+        # Guard flags for summary; default to None until computed
+        "buy_guard_ok": None,
+        "sell_guard_ok": None,
+    }
+    # compute IBKR delta if provided
+    if optional_ibkr_price is not None and optional_ibkr_price and price is not None:
+        try:
+            metrics["ibkr_delta_pct"] = (price / optional_ibkr_price - 1.0) * 100.0
+        except Exception:
+            metrics["ibkr_delta_pct"] = None
+    # compute simplified scoring
+    cfg = PROFILE_CONFIG.get(profile, PROFILE_CONFIG[DEFAULT_PROFILE])
+    score = 0.0
+    reasons: List[str] = []
+    # Trend heuristics
+    if metrics["sma50"] is not None and price is not None:
+        if price > metrics["sma50"]:
+            score += 1.0
+            reasons.append("Price > SMA50 (trend up)")
+        else:
+            score -= 0.5
+            reasons.append("Price < SMA50 (trend weak)")
+    if metrics["sma200"] is not None and price is not None:
+        if price > metrics["sma200"]:
+            score += 1.0
+            reasons.append("Price > SMA200 (long-term up)")
+        else:
+            score -= 0.5
+            reasons.append("Price < SMA200 (long-term weak)")
+    if metrics["sma50"] is not None and metrics["sma200"] is not None:
+        if metrics["sma50"] > metrics["sma200"]:
+            score += 0.75
+            reasons.append("SMA50 > SMA200 (golden trend)")
+        else:
+            score -= 0.25
+            reasons.append("SMA50 ≤ SMA200")
+    # Slope 50d
+    if slope50 is not None:
+        if slope50 > 0:
+            score += 0.5
+            reasons.append("SMA50 rising")
+        else:
+            score -= 0.5
+            reasons.append("SMA50 falling")
+    # Momentum via MACD
+    if macd_ok:
+        score += 1.0
+        reasons.append("MACD > Signal (positive momentum)")
+    elif macd_neg:
+        score -= 0.25
+        reasons.append("MACD momentum negative")
+    # RSI heuristics
+    rsi_val = metrics["rsi14"] if metrics["rsi14"] is not None else 50.0
+    upper = cfg.get("rsi_upper", 70)
+    if rsi_val >= upper:
+        score -= 0.5
+        reasons.append(f"RSI {rsi_val:.1f} hot (>" + str(upper) + ")")
+    elif rsi_val >= 50:
+        score += 0.75
+        reasons.append(f"RSI {rsi_val:.1f} healthy")
+    elif rsi_val >= 40:
+        score -= 0.25
+        reasons.append(f"RSI {rsi_val:.1f} below 50")
+    else:
+        score -= 0.75
+        reasons.append(f"RSI {rsi_val:.1f} weak")
+    # Volume and breakout
+    vol_threshold = 1.2
+    if near_high and (vol_surge is not None and vol_surge >= vol_threshold):
+        score += 1.5
+        reasons.append(f"Breakout with volume x{vol_surge:.2f}")
+    elif near_high:
+        score += 0.5
+        reasons.append("Near 20d high")
+    elif near_low:
+        score -= 1.0
+        reasons.append("Near 20d low")
+    # Additional volume surge boost
+    if vol_surge is not None and vol_surge >= 1.3:
+        score += 0.75
+        reasons.append(f"Volume surge x{vol_surge:.2f}")
+    # Volatility penalty
+    vol_penalty = cfg.get("volatility_penalty", 0.5)
+    if metrics["atr_pct"] is not None and metrics["atr_pct"] > 4.0:
+        score -= vol_penalty
+        if vol_penalty > 0:
+            reasons.append(f"High volatility (ATR {metrics['atr_pct']:.1f}%)")
+    # Extension penalty
+    if metrics["ext_pct"] is not None and metrics["ext_pct"] > 8.0:
+        score -= 0.5
+        reasons.append(f"Extended {metrics['ext_pct']:.1f}% above 50d")
+    # Relative strength vs SPY
+    if metrics["rel20d_pp"] is not None:
+        if metrics["rel20d_pp"] > 0:
+            score += 0.5
+            reasons.append(f"Outperforming SPY by {metrics['rel20d_pp']:.1f}pp (20d)")
+        else:
+            score -= 0.25
+            reasons.append(f"Underperforming SPY by {abs(metrics['rel20d_pp']):.1f}pp")
+    # Determine guards (simplified)
+    buy_guard_ok = False
+    sell_guard_ok = False
+    try:
+        vol_ok_simple = (vol_surge is not None and vol_surge >= 1.3)
+        breakout_vol_ok = bool(near_high or vol_ok_simple)
+        buy_guard_ok = bool(macd_ok and breakout_vol_ok and spy_regime_ok)
+        high_volume_down = (vol_surge is not None and vol_surge >= 1.3 and len(close) > 1 and not np.isnan(close.diff().iloc[-1]) and close.diff().iloc[-1] < 0)
+        sell_guard_ok = bool(macd_neg or near_low or high_volume_down)
+    except Exception:
+        buy_guard_ok = False
+        sell_guard_ok = False
+    metrics["buy_guard_ok"] = buy_guard_ok
+    metrics["sell_guard_ok"] = sell_guard_ok
+    # Map score to discrete signal based on profile thresholds
+    thresholds = PROFILE_CONFIG.get(profile, PROFILE_CONFIG[DEFAULT_PROFILE])
+    buy_th = thresholds.get("buy_threshold", 4.0)
+    sell_th = thresholds.get("sell_threshold", -1.0)
+    res["score"] = round(score, 2)
+    if score >= buy_th:
+        res["signal"] = "BUY"
+    elif score <= sell_th:
+        res["signal"] = "SELL"
+    else:
+        res["signal"] = "HOLD"
+    res["metrics"] = metrics
+    res["explanations"] = reasons
+    res["df"] = df
+    return res
+
 # ---------------- AUTH (username + password via Supabase) ----------------
 def _username_to_email(u: str) -> str:
     base = slugify((u or "").strip().lower()) or "user"
@@ -3504,14 +3824,34 @@ with st.spinner("Analyzing tickers…"):
     except Exception:
         pre_spy = None
     for t in watch:
-        res = analyze_ticker(
-            t,
-            profile,
-            optional_ibkr_price=ibkr_inputs.get(t),
-            relax_guards=relax_guards,
-            market_guard=market_guard,
-            spy_df=pre_spy,
-        )
+        # Use lightweight analysis in live mode to improve performance.  Otherwise run the full analysis.
+        if st.session_state.get("live_mode", False):
+            try:
+                res = analyze_ticker_fast(
+                    t,
+                    profile,
+                    optional_ibkr_price=ibkr_inputs.get(t),
+                    spy_df=pre_spy,
+                )
+            except Exception:
+                res = {
+                    "ticker": t,
+                    "error": "Analysis failed",
+                    "metrics": {},
+                    "score": 0.0,
+                    "signal": "HOLD",
+                    "explanations": [],
+                    "df": None,
+                }
+        else:
+            res = analyze_ticker(
+                t,
+                profile,
+                optional_ibkr_price=ibkr_inputs.get(t),
+                relax_guards=relax_guards,
+                market_guard=market_guard,
+                spy_df=pre_spy,
+            )
         results.append(res)
 
 # Summary table
