@@ -1249,7 +1249,7 @@ sb: Client | None = create_client(SUPABASE_URL, SUPABASE_ANON_KEY) if (SUPABASE_
 # ---------------- Config ----------------
 APP_TITLE = "📈 Watchlist Swing-Assistant"
 # Extend the default watchlist with major ETFs for diversification across asset classes.
-DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "SPY", "QQQ", "IWM", "TLT"]
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL"]
 DEFAULT_PROFILE = "Balanced"
 CACHE_TTL_SECONDS = 60 * 15
 MAX_LOOKBACK_DAYS = 240
