@@ -3375,6 +3375,24 @@ with st.sidebar:
         value=live_default,
         help="Stream real‑time prices using Alpaca. Requires API keys in the environment."
     )
+    # ------------------------------------------------------------------
+    # Optional slider to control auto‑refresh frequency while live mode
+    # is enabled.  This allows the user to choose how often the watchlist
+    # page should update when streaming real‑time prices.  Values are in
+    # seconds, from 5 to 60, stepping by 5.  The selected value is
+    # persisted in st.session_state["live_refresh_sec"] so that the
+    # auto‑refresh logic can pick it up later.  When live mode is off,
+    # the slider has no effect.
+    live_refresh_sec = st.slider(
+        "Live refresh (sec)",
+        min_value=5,
+        max_value=60,
+        value=int(st.session_state.get("live_refresh_sec", 15)),
+        step=5,
+        help="Колко често да се опреснява Watchlist, когато Live е включен."
+    )
+    st.session_state["live_refresh_sec"] = live_refresh_sec
+
     # ------------------------------
     # 🔍 DEBUG: Alba Live Status
     # ------------------------------
@@ -3427,11 +3445,14 @@ with st.sidebar:
     # ---------------------------------------------
     if page == "Watchlist" and HAS_AUTOR:
 
-        # Ако Live mode е включен → принудителен refresh на 5 секунди
+        # When live mode is enabled, refresh using the slider value.
         if st.session_state.get("live_mode", False):
-            st_autorefresh(interval=5 * 1000, key="live_autorefresh")
+            sec = int(st.session_state.get("live_refresh_sec", 15))
+            # only schedule a refresh if a positive number of seconds is chosen
+            if sec > 0:
+                st_autorefresh(interval=sec * 1000, key="live_autorefresh")
 
-        # Ако Live mode НЕ е включен → използваме стандартните минути
+        # When live mode is disabled, use the minutes value from settings.
         else:
             refresh_minutes = state.get("auto_refresh_minutes", 15)
             if refresh_minutes > 0:
