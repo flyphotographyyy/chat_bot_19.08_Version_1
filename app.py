@@ -3422,9 +3422,21 @@ with st.sidebar:
             _stop_live_feed()
         st.rerun()
 
-    # Auto-refresh (only on Watchlist page)
-    if page == "Watchlist" and state.get("auto_refresh_minutes", 15) > 0 and HAS_AUTOR:
-        st_autorefresh(interval=state["auto_refresh_minutes"] * 60 * 1000, key="autorefresh")
+    # ---------------------------------------------
+    # Auto-refresh logic
+    # ---------------------------------------------
+    if page == "Watchlist" and HAS_AUTOR:
+
+        # Ако Live mode е включен → принудителен refresh на 5 секунди
+        if st.session_state.get("live_mode", False):
+            st_autorefresh(interval=5 * 1000, key="live_autorefresh")
+
+        # Ако Live mode НЕ е включен → използваме стандартните минути
+        else:
+            refresh_minutes = state.get("auto_refresh_minutes", 15)
+            if refresh_minutes > 0:
+                st_autorefresh(interval=refresh_minutes * 60 * 1000, key="autorefresh")
+   
 
 # -------- Page routing --------
 if page == "Trading Console":
